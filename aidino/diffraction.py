@@ -210,8 +210,8 @@ class BraggCoherentDiffraction:
         supercell_size: Tuple
             Size of supercells (d1, d2, d3) in unit cells
         continuum_displacement: torch.Tensor, optional
+            Tensor of shape [batch_size, n_sc1, n_sc2, n_sc3, 3] or [batch_size, n_supercells, 3].
             Per-supercell rigid shift in Cartesian coordinates in units of meters.
-            Shape [batch_size, n_sc1, n_sc2, n_sc3, 3] or [batch_size, n_supercells, 3].
         mask: torch.Tensor, optional
             Optional mask of shape [batch_size, n1, n2, n3] or [batch_size, n_sc1, n_sc2, n_sc3]
         q_batch_size: int, optional
@@ -293,6 +293,7 @@ class BraggCoherentDiffraction:
         q_vectors: Tensor,
         supercell_size: Tuple[int, int, int],
         sublattice_displacement: Tensor,
+        lattice_strain: Optional[Tensor] = None,
         continuum_displacement: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         q_batch_size: Optional[int] = None
@@ -309,10 +310,13 @@ class BraggCoherentDiffraction:
         sublattice_displacement: torch.Tensor
             Tensor of shape [batch_size, n1, n2, n3, n_atoms, 3] or [batch_size, n_sc1, n_sc2, n_sc3, n_atoms, 3]
             containing the unique or supercell-averaged displacement field for each atom, respectively.
-            Expressed in fractional coordinates relative to L0.
+            Expressed in fractional coordinates relative to the original crystal lattice vectors.
+        lattice_strain: torch.Tensor, optional
+            Tensor of shape [batch_size, n_sc1, n_sc2, n_sc3, 3, 3] or [batch_size, n_supercells, 3, 3].
+            Per-supercell lattice perturbation δL in Cartesian coordinates in units of meters.
         continuum_displacement: torch.Tensor, optional
+            Tensor of shape [batch_size, n_sc1, n_sc2, n_sc3, 3] or [batch_size, n_supercells, 3].
             Per-supercell rigid shift in Cartesian coordinates in units of meters.
-            Shape [batch_size, n_sc1, n_sc2, n_sc3, 3] or [batch_size, n_supercells, 3].
         mask: torch.Tensor, optional
             Optional mask of shape [batch_size, n1, n2, n3] or [batch_size, n_sc1, n_sc2, n_sc3]
         q_batch_size: int, optional
@@ -367,6 +371,44 @@ class BraggCoherentDiffraction:
         # Convert displacements from crystal fractional coordinates to Cartesian lab frame
         sublattice_displacement_flat = torch.matmul(sublattice_displacement_flat, self.crystal.lattice_vectors)
 
+        # Incorporate lattice strain into sublattice displacement
+        # A local strain δL perturbs the Cartesian position of atom m in supercell n by
+        # δr_m^strain(n) = f_m @ δL(n), where f_m are the fractional coordinates of atom m.
+        # This is precomputed once and added to sublattice_displacement_flat.
+        if lattice_strain is not None:
+            # Check dimensions and convert to supercell level if needed
+            if lattice_strain.shape[-5:-2] == (n1, n2, n3):
+                # Lattice strain is at unit cell resolution - downsample to supercell resolution
+                # Reshape to group unit cells into supercells: [batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, 3, 3]
+                grouped_strain = lattice_strain.view(batch_size, n_sc1, d1, n_sc2, d2, n_sc3, d3, 3, 3)
+
+                # Average over supercell dimensions (2, 4, 6) -> [batch_size, n_sc1, n_sc2, n_sc3, 3, 3]
+                lattice_strain_flat = torch.mean(grouped_strain, dim=(2, 4, 6)).view(batch_size, -1, 3, 3)
+
+            elif lattice_strain.shape[-5:-2] == (n_sc1, n_sc2, n_sc3):
+                # Lattice strain is already at supercell resolution
+                lattice_strain_flat = lattice_strain.view(batch_size, -1, 3, 3)
+
+            else:
+                raise ValueError(
+                    f"Lattice strain shape {lattice_strain.shape[-5:-2]} is incompatible with crystal grid "
+                    f"of size ({n1}, {n2}, {n3}) or supercell grid ({n_sc1}, {n_sc2}, {n_sc3})"
+                )
+
+            # Fractional coordinates of atoms from CIF structure (frame-invariant, dimensionless)
+            # atom_fracs shape: [n_atoms, 3]
+            atom_fracs = self.crystal.atom_frac_coords
+
+            # Strain displacement for each atom in each supercell: δr_m = f_m @ δL(n)
+            # atom_fracs shape:          [n_atoms, 3]
+            # lattice_strain_flat shape: [batch_size, n_supercells, 3, 3]
+            # Result shape:              [batch_size, n_supercells, n_atoms, 3] Cartesian meters, lab frame
+            strain_displacement_flat = torch.einsum('mi,bnij->bnmj', atom_fracs, lattice_strain_flat)
+
+            # Add to sublattice displacement — both are Cartesian meters in the lab frame
+            # sublattice_displacement_flat shape: [batch_size, n_supercells, n_atoms, 3]
+            sublattice_displacement_flat = sublattice_displacement_flat + strain_displacement_flat
+            
         # Determine batch size
         if q_batch_size is None:
             q_batch_size = n_pixels

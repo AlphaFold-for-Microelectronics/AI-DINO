@@ -216,6 +216,10 @@ class Crystal:
         return torch.tensor(self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device)
 
     @property
+    def atom_frac_coords(self) -> Tensor:
+        return torch.tensor(self.structure.frac_coords, dtype=self.dtype, device=self.device)
+    
+    @property
     def n_atoms(self) -> int:
         return len(self.atom_types)
         
