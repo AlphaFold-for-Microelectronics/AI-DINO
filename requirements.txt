@@ -13,5 +13,6 @@ scikit-learn==1.6.1
 scipy==1.15.2
 seaborn==0.13.2
 torch==2.5.1
+torchdiffeq==0.2.5
 tqdm==4.67.1
 xraydb==4.5.8
