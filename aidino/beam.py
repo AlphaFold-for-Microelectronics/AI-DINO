@@ -23,28 +23,17 @@ class Beam:
     All beam classes should implement the _calculate_transverse_profile method.
     """
     
-    def __init__(
-        self,
-        wavelength: float,
-        dtype: torch.dtype = torch.float32,
-        device: str = 'cuda'
-    ):
+    def __init__(self, wavelength: float):
         """
         Initialize beam with fundamental properties.
-        
+
         Parameters
         ----------
         wavelength : float
             X-ray wavelength in meters
-        dtype : torch.dtype
-            PyTorch data type
-        device : str
-            PyTorch device ('cuda' or 'cpu')
         """
         self.wavelength = wavelength
-        self.dtype = dtype
-        self.device = device
-        
+
         # Calculate energy from wavelength
         self.energy = wavelength_to_energy(wavelength)
     
@@ -69,143 +58,158 @@ class Beam:
             Transverse intensity profile [n1, n2, n3], normalized to max=1
         """
         raise NotImplementedError
-    
+
+    @staticmethod
+    def _supercell_lab_coords(crystal, supercell_size: Tuple[int, int, int]) -> Tensor:
+        """
+        Lab-frame Cartesian positions of every supercell center.
+        Returns [3, n_sc1, n_sc2, n_sc3] in (crystal.dtype, crystal.device).
+        """
+        c1, c2, c3 = crystal.crystal_size
+        s1, s2, s3 = supercell_size
+        n1, n2, n3 = c1 // s1, c2 // s2, c3 // s3
+        dtype, device = crystal.dtype, crystal.device
+
+        i = torch.arange(n1, device=device, dtype=dtype) * s1 + s1 / 2.0
+        j = torch.arange(n2, device=device, dtype=dtype) * s2 + s2 / 2.0
+        k = torch.arange(n3, device=device, dtype=dtype) * s3 + s3 / 2.0
+        ii, jj, kk = torch.meshgrid(i, j, k, indexing="ij")
+        coords_uc = torch.stack([ii, jj, kk], dim=0)  # [3, n1, n2, n3]
+        return torch.einsum('ijkl,im->mjkl', coords_uc, crystal.lattice_vectors)
+
+    @staticmethod
+    def _orthonormal_basis_perp_to(k_hat: Tensor, up: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        """
+        Return an orthonormal basis (u, v) for the plane perpendicular to k_hat.
+        If `up` is None, defaults to lab-z (or lab-x when k_hat is near lab-z).
+        """
+        if up is None:
+            up = torch.tensor(
+                [0., 0., 1.] if torch.abs(k_hat[2]) < 0.9 else [1., 0., 0.],
+                device=k_hat.device, dtype=k_hat.dtype,
+            )
+        else:
+            up = up.to(device=k_hat.device, dtype=k_hat.dtype)
+
+        u = up - torch.dot(up, k_hat) * k_hat
+        u_norm = torch.norm(u)
+        if u_norm == 0:
+            raise ValueError("`up` is parallel to k_hat; cannot build a perpendicular basis.")
+        u = u / u_norm
+        v = torch.linalg.cross(k_hat, u)
+        return u, v / torch.norm(v)
+
+    @staticmethod
+    def _radial_distance_sq(coords_transverse: Tensor, center: Tuple[float, float]) -> Tensor:
+        """Squared distance from `center` for each point in coords_transverse [2, ...]."""
+        return (coords_transverse[0] - center[0]) ** 2 + (coords_transverse[1] - center[1]) ** 2
+
+    def _auto_beam_center(
+        self,
+        crystal,
+        supercell_size: Tuple[int, int, int],
+        k_hat: Tensor,
+    ) -> list:
+        """
+        Pick the entry face whose outward normal is most opposite to k_hat,
+        and place the beam center at the corresponding edge-most supercell
+        center on the dominant axis (transverse axes at crystal center).
+        """
+        # Crystal face normals in lab frame are just the normalized lattice vectors
+        lattice_vectors_normalized = crystal.lattice_vectors / torch.norm(
+            crystal.lattice_vectors, dim=1, keepdim=True
+        )
+        # Indices 0,1,2 = +a,+b,+c face; 3,4,5 = -a,-b,-c face.
+        face_normals_crystal = torch.cat([
+             lattice_vectors_normalized,
+            -lattice_vectors_normalized,
+        ], dim=0)
+        best_face_idx = torch.argmax(torch.matmul(face_normals_crystal, -k_hat)).item()
+        dominant_axis = best_face_idx % 3
+        enters_from_positive = best_face_idx < 3
+
+        c = list(crystal.crystal_size)
+        s = list(supercell_size)
+        beam_center = [c[0] / 2.0, c[1] / 2.0, c[2] / 2.0]
+        if enters_from_positive:
+            beam_center[dominant_axis] = c[dominant_axis] - s[dominant_axis] / 2.0
+        else:
+            beam_center[dominant_axis] = s[dominant_axis] / 2.0
+
+        axis_name = 'abc'[dominant_axis]
+        side = '+' if enters_from_positive else '-'
+        print(f"Auto beam entry: crystal {side}{axis_name} face. beam_center = {tuple(beam_center)}")
+        return beam_center
+
     def create_profile(
         self,
         crystal,
         supercell_size: Tuple[int, int, int],
         k_i: Tensor,
         beam_center: Optional[Tuple[float, float, float]] = None,
+        up: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Create beam profile from incident wavevector.
-        
+
         Parameters
         ----------
         crystal : Crystal
-            Crystal object with lattice vectors
+            Crystal object with lattice vectors.
         supercell_size : tuple
-            Size of supercells (s1, s2, s3)
+            Size of supercells (s1, s2, s3).
         k_i : Tensor
-            Incident wavevector (normalized or not)
+            Incident wavevector (propagation direction, source → sample).
+            Normalized internally; only the direction matters.
         beam_center : tuple, optional
-            Beam entry point in unit-cell coordinates (a, b, c indices).
-            If None, automatically determined from k_i.
+            Beam entry point in unit-cell index space along (a, b, c). Each
+            component runs from 0 to crystal.crystal_size[axis]. If None,
+            automatically determined from k_i.
+        up : Tensor, optional
+            Lab-frame "up" direction used to anchor the transverse basis.
+            Must not be parallel to k_i. If None, defaults to lab-z (or lab-x
+            when k_i is near lab-z), reproducing the historical heuristic.
+            Pass this to keep the transverse u/v axes stable as k_i changes.
+
+        Notes
+        -----
+        Sets self.profile to a [1, n_sc1, n_sc2, n_sc3] tensor. The longitudinal
+        attenuation profile (depth - depth.min()) is exact for beams aligned
+        with a crystal axis and an approximation for oblique beams (rays that
+        enter through different faces are not raycast individually).
         """
         
-        c1, c2, c3 = crystal.crystal_size
-        s1, s2, s3 = supercell_size
-        n1, n2, n3 = c1 // s1, c2 // s2, c3 // s3
-        
-        # Normalize beam direction (in lab frame)
-        k_hat = k_i / torch.norm(k_i)
-        k_hat = k_hat.to(device=self.device, dtype=self.dtype)
-        
-        # Determine entry point in lab frame, then project to crystal frame
-        if beam_center is None:
-            # Find which lab-frame face the beam enters from
-            # The beam enters the face most perpendicular to -k_hat (i.e., facing the beam)
+        # Match the crystal's dtype/device so all subsequent arithmetic is consistent.
+        dtype = crystal.dtype
+        device = crystal.device
 
-            # Crystal face normals in lab frame are just the normalized lattice vectors
-            lattice_vectors_normalized = crystal.lattice_vectors / torch.norm(
-                crystal.lattice_vectors, dim=1, keepdim=True
-            )
-            
-            # For each of the 6 crystal faces (±a, ±b, ±c), find which is most
-            # aligned with the incoming beam direction (-k_hat = beam comes from there)
-            face_normals_crystal = torch.cat([
-                 lattice_vectors_normalized,
-                -lattice_vectors_normalized
-            ], dim=0)  # [6, 3] in lab frame
-            
-            alignments = torch.matmul(face_normals_crystal, -k_hat)
-            best_face_idx = torch.argmax(alignments).item()
-            
-            # Decode: indices 0,1,2 = +a,+b,+c face; 3,4,5 = -a,-b,-c face
-            dominant_crystal_axis = best_face_idx % 3
-            enters_from_positive = best_face_idx < 3
-            
-            beam_center = [c1 / 2.0, c2 / 2.0, c3 / 2.0]
-            
-            if enters_from_positive:
-                # Beam enters from high-index face
-                beam_center[dominant_crystal_axis] = (
-                    crystal.crystal_size[dominant_crystal_axis] -
-                    supercell_size[dominant_crystal_axis] / 2.0
-                )
-            else:
-                # Beam enters from low-index face
-                beam_center[dominant_crystal_axis] = supercell_size[dominant_crystal_axis] / 2.0
-            
-            axis_name = ['a', 'b', 'c'][dominant_crystal_axis]
-            side = '+' if enters_from_positive else '-'
-            print(f"Auto beam entry: crystal {side}{axis_name} face, "
-                  f"\nBeam_center: {tuple(beam_center)}")
+        # Normalize beam direction (in lab frame)
+        if k_i.numel() != 3:
+            raise ValueError(f"k_i must have 3 elements, got shape {tuple(k_i.shape)}")
+        k_i_norm = torch.norm(k_i)
+        if k_i_norm == 0:
+            raise ValueError("k_i must be a nonzero vector")
+        k_hat = (k_i / k_i_norm).to(device=device, dtype=dtype)
         
-        # Create coordinate grids in crystal frame
-        i = torch.arange(n1, device=self.device, dtype=self.dtype)
-        j = torch.arange(n2, device=self.device, dtype=self.dtype)
-        k = torch.arange(n3, device=self.device, dtype=self.dtype)
-        
-        ii, jj, kk = torch.meshgrid(i, j, k, indexing="ij")
-        
-        # Supercell centers in unit cell coordinates
-        coords_uc = torch.stack([
-            ii * s1 + s1 / 2.0,  # Ranges from s1/2 to (n1-1)*s1 + s1/2 = c1 - s1/2
-            jj * s2 + s2 / 2.0,
-            kk * s3 + s3 / 2.0
-        ], dim=0)  # [3, n1, n2, n3]
-        
-        # Transform to lab frame using lattice vectors
-        # r_lab = n_a * a_vec + n_b * b_vec + n_c * c_vec
-        coords_lab = (
-            coords_uc[0].unsqueeze(0) * crystal.lattice_vectors[0].view(3, 1, 1, 1) +
-            coords_uc[1].unsqueeze(0) * crystal.lattice_vectors[1].view(3, 1, 1, 1) +
-            coords_uc[2].unsqueeze(0) * crystal.lattice_vectors[2].view(3, 1, 1, 1)
-        )  # [3, n1, n2, n3] in lab frame (meters)
-        
-        # Transform beam_center to lab frame
-        beam_center_lab = (
-            beam_center[0] * crystal.lattice_vectors[0] +
-            beam_center[1] * crystal.lattice_vectors[1] +
-            beam_center[2] * crystal.lattice_vectors[2]
-        )  # [3] in lab frame (meters)
-        
-        # Position relative to beam entry
-        r = coords_lab - beam_center_lab.view(3, 1, 1, 1)
-        del coords_lab  # Free this immediately
-        
-        # Distance along beam direction
-        depth = torch.sum(r * k_hat.view(3, 1, 1, 1), dim=0)  # [n1, n2, n3]
-        
-        # Transverse component (perpendicular to beam)
-        r_parallel = depth.unsqueeze(0) * k_hat.view(3, 1, 1, 1)
-        r_transverse = r - r_parallel  # [3, n1, n2, n3]
-        del r, r_parallel  # Free these immediately
-        
-        # Create orthonormal basis in transverse plane
-        if torch.abs(k_hat[2]) < 0.9:
-            arbitrary = torch.tensor([0., 0., 1.], device=self.device, dtype=self.dtype)
-        else:
-            arbitrary = torch.tensor([1., 0., 0.], device=self.device, dtype=self.dtype)
-        
-        u_transverse = arbitrary - torch.dot(arbitrary, k_hat) * k_hat
-        u_transverse = u_transverse / torch.norm(u_transverse)
-        
-        v_transverse = torch.linalg.cross(k_hat, u_transverse)
-        v_transverse = v_transverse / torch.norm(v_transverse)
-        
-        # Project transverse positions onto 2D basis
-        coords_transverse = torch.stack([
-            torch.sum(r_transverse * u_transverse.view(3, 1, 1, 1), dim=0),
-            torch.sum(r_transverse * v_transverse.view(3, 1, 1, 1), dim=0)
-        ], dim=0)  # [2, n1, n2, n3]
-        del r_transverse  # Free this immediately
-        
+        if beam_center is None:
+            beam_center = self._auto_beam_center(crystal, supercell_size, k_hat)
+
+        # Lab-frame positions, shifted to beam-center origin
+        coords_lab = self._supercell_lab_coords(crystal, supercell_size)
+        beam_center_lab = torch.as_tensor(beam_center, dtype=dtype, device=device) @ crystal.lattice_vectors
+        shifted = coords_lab - beam_center_lab.view(3, 1, 1, 1)
+
+        # Project onto (k_hat, u, v) in one einsum — no r/r_parallel/r_transverse materialization
+        u_t, v_t = self._orthonormal_basis_perp_to(k_hat, up)
+        basis = torch.stack([k_hat, u_t, v_t], dim=0)                # [3 basis, 3 lab]
+        projections = torch.einsum('ijkl,bi->bjkl', shifted, basis)  # [3, n1, n2, n3]
+        depth = projections[0]
+        coords_transverse = projections[1:]                          # [2, n1, n2, n3]
+
         # Calculate transverse profile (calls subclass-specific method)
         transverse_profile = self._calculate_transverse_profile(
-            coords_transverse, 
-            (0.0, 0.0)  # Beam centered at origin in transverse coords
+            coords_transverse,
+            (0.0, 0.0),  # Beam centered at origin in transverse coords
         )
         
         # Get penetration depth
@@ -328,23 +332,8 @@ class Beam:
         ax_ab   = fig.add_subplot(gs_slices[0, 2])
         ax_cbar = fig.add_subplot(gs_bot[0, 1])
     
-        # 3D panel
-        i_ = torch.arange(n1, device=self.device, dtype=self.dtype)
-        j_ = torch.arange(n2, device=self.device, dtype=self.dtype)
-        k_ = torch.arange(n3, device=self.device, dtype=self.dtype)
-        ii, jj, kk = torch.meshgrid(i_, j_, k_, indexing="ij")
-    
-        coords_uc = torch.stack([
-            ii * s1 + s1 / 2.0,
-            jj * s2 + s2 / 2.0,
-            kk * s3 + s3 / 2.0,
-        ], dim=0)
-    
-        coords_lab = (
-            coords_uc[0].unsqueeze(0) * crystal.lattice_vectors[0].view(3,1,1,1) +
-            coords_uc[1].unsqueeze(0) * crystal.lattice_vectors[1].view(3,1,1,1) +
-            coords_uc[2].unsqueeze(0) * crystal.lattice_vectors[2].view(3,1,1,1)
-        ) * 1e9  # nm
+        # 3D panel — reuse the same lab-frame coord builder as create_profile
+        coords_lab = self._supercell_lab_coords(crystal, supercell_size) * 1e9  # nm
     
         lab_x = coords_lab[0].cpu().numpy().ravel()
         lab_y = coords_lab[1].cpu().numpy().ravel()
@@ -489,24 +478,18 @@ class GaussianBeam(Beam):
         self,
         wavelength: float,
         fwhm: float,
-        dtype: torch.dtype = torch.float32,
-        device: str = 'cuda'
     ):
         """
         Initialize Gaussian beam.
-        
+
         Parameters
         ----------
         wavelength : float
             X-ray wavelength in meters
         fwhm : float
             Full width at half maximum in meters
-        dtype : torch.dtype
-            PyTorch data type
-        device : str
-            PyTorch device
         """
-        super().__init__(wavelength, dtype, device)
+        super().__init__(wavelength)
         self.fwhm = fwhm
         
         # Convert FWHM to Gaussian sigma
@@ -518,16 +501,8 @@ class GaussianBeam(Beam):
         beam_center_transverse: Tuple[float, float]
     ) -> Tensor:
         """Calculate Gaussian profile in transverse plane."""
-        
-        # Calculate distance from beam center
-        r_sq = torch.zeros_like(coords_transverse[0])
-        for i, center in enumerate(beam_center_transverse):
-            r_sq += (coords_transverse[i] - center) ** 2
-        
-        # Gaussian profile
-        profile = torch.exp(-r_sq / (2 * self.sigma ** 2))
-        
-        return profile
+        r_sq = Beam._radial_distance_sq(coords_transverse, beam_center_transverse)
+        return torch.exp(-r_sq / (2 * self.sigma ** 2))
     
     def __repr__(self):
         return (f"GaussianBeam(wavelength={self.wavelength:.3e}m, "
@@ -535,59 +510,58 @@ class GaussianBeam(Beam):
 
 
 class EllipticalBeam(Beam):
-    """Elliptical Gaussian beam (different FWHM in two transverse directions)."""
-    
+    """Elliptical Gaussian beam with different FWHM along the u and v
+    axes of the transverse basis built in Beam.create_profile."""
+
     def __init__(
         self,
         wavelength: float,
-        fwhm_horizontal: float,
-        fwhm_vertical: float,
-        dtype: torch.dtype = torch.float32,
-        device: str = 'cuda'
+        fwhm_u: float,
+        fwhm_v: float,
     ):
         """
         Initialize elliptical Gaussian beam.
-        
+
         Parameters
         ----------
         wavelength : float
-            X-ray wavelength in meters
-        fwhm_horizontal : float
-            FWHM in first transverse direction (meters)
-        fwhm_vertical : float
-            FWHM in second transverse direction (meters)
-        dtype : torch.dtype
-            PyTorch data type
-        device : str
-            PyTorch device
+            X-ray wavelength in meters.
+        fwhm_u : float
+            FWHM along the first transverse basis axis (u) in meters.
+        fwhm_v : float
+            FWHM along the second transverse basis axis (v) in meters.
+
+        Notes
+        -----
+        u/v are determined by Beam.create_profile from k_i and the optional
+        `up` argument. They are NOT lab-horizontal / lab-vertical unless `up`
+        is explicitly set so that u, v align with the lab axes you want.
         """
-        super().__init__(wavelength, dtype, device)
-        self.fwhm_horizontal = fwhm_horizontal
-        self.fwhm_vertical = fwhm_vertical
-        
+        super().__init__(wavelength)
+        self.fwhm_u = fwhm_u
+        self.fwhm_v = fwhm_v
+
         # Convert to sigmas
         sqrt_2ln2 = torch.sqrt(2 * torch.log(torch.tensor(2.0)))
-        self.sigma_h = fwhm_horizontal / (2 * sqrt_2ln2)
-        self.sigma_v = fwhm_vertical / (2 * sqrt_2ln2)
-    
+        self.sigma_u = fwhm_u / (2 * sqrt_2ln2)
+        self.sigma_v = fwhm_v / (2 * sqrt_2ln2)
+
     def _calculate_transverse_profile(
         self,
         coords_transverse: Tensor,
         beam_center_transverse: Tuple[float, float]
     ) -> Tensor:
         """Calculate elliptical Gaussian profile."""
-        
+
         # Distance in each direction, normalized by respective sigma
-        delta_h = (coords_transverse[0] - beam_center_transverse[0]) / self.sigma_h
+        delta_u = (coords_transverse[0] - beam_center_transverse[0]) / self.sigma_u
         delta_v = (coords_transverse[1] - beam_center_transverse[1]) / self.sigma_v
-        
-        profile = torch.exp(-0.5 * (delta_h**2 + delta_v**2))
-        
-        return profile
-    
+
+        return torch.exp(-0.5 * (delta_u ** 2 + delta_v ** 2))
+
     def __repr__(self):
         return (f"EllipticalBeam(wavelength={self.wavelength:.3e}m, "
-                f"fwhm_h={self.fwhm_horizontal:.3e}m, fwhm_v={self.fwhm_vertical:.3e}m, "
+                f"fwhm_u={self.fwhm_u:.3e}m, fwhm_v={self.fwhm_v:.3e}m, "
                 f"energy={self.energy / 1000.:.2f}keV)")
 
 
@@ -598,24 +572,18 @@ class TopHatBeam(Beam):
         self,
         wavelength: float,
         diameter: float,
-        dtype: torch.dtype = torch.float32,
-        device: str = 'cuda'
     ):
         """
         Initialize top-hat beam.
-        
+
         Parameters
         ----------
         wavelength : float
             X-ray wavelength in meters
         diameter : float
             Beam diameter in meters
-        dtype : torch.dtype
-            PyTorch data type
-        device : str
-            PyTorch device
         """
-        super().__init__(wavelength, dtype, device)
+        super().__init__(wavelength)
         self.diameter = diameter
         self.radius = diameter / 2.0
     
@@ -625,18 +593,9 @@ class TopHatBeam(Beam):
         beam_center_transverse: Tuple[float, float]
     ) -> Tensor:
         """Calculate top-hat profile (1 inside radius, 0 outside)."""
-        
-        # Calculate distance from beam center
-        r_sq = torch.zeros_like(coords_transverse[0])
-        for i, center in enumerate(beam_center_transverse):
-            r_sq += (coords_transverse[i] - center) ** 2
-        
-        r = torch.sqrt(r_sq)
-        
-        # Step function
-        profile = (r <= self.radius).to(self.dtype)
-        
-        return profile
+        r_sq = Beam._radial_distance_sq(coords_transverse, beam_center_transverse)
+        # Step function — match the input tensor's dtype
+        return (r_sq <= self.radius ** 2).to(r_sq.dtype)
     
     def __repr__(self):
         return (f"TopHatBeam(wavelength={self.wavelength:.3e}m, "
@@ -654,12 +613,10 @@ class CustomBeam(Beam):
         self,
         wavelength: float,
         profile_func,
-        dtype: torch.dtype = torch.float32,
-        device: str = 'cuda'
     ):
         """
         Initialize custom beam from a function.
-        
+
         Parameters
         ----------
         wavelength : float
@@ -667,12 +624,8 @@ class CustomBeam(Beam):
         profile_func : callable
             Function that takes (coords_transverse, beam_center_transverse) and
             returns intensity profile
-        dtype : torch.dtype
-            PyTorch data type
-        device : str
-            PyTorch device
         """
-        super().__init__(wavelength, dtype, device)
+        super().__init__(wavelength)
         self.profile_func = profile_func
     
     def _calculate_transverse_profile(

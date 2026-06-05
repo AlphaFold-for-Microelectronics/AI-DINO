@@ -22,6 +22,12 @@ from matplotlib.figure import Figure
 from aidino.xray_utils import wavelength_to_energy
 from aidino.plot_utils import props, format_axis
 
+_AXIS_DIRECTIONS = {
+    'x': np.array([1, 0, 0]),
+    'y': np.array([0, 1, 0]),
+    'z': np.array([0, 0, 1]),
+}
+
 class Crystal:
     """
     Class representing a crystalline sample.
@@ -30,7 +36,7 @@ class Crystal:
     def __init__(
         self,
         cif_path: str,
-        crystal_size: Tuple[int, int, int],
+        crystal_size: Optional[Tuple[int, int, int]] = None,
         wavelength: float = None,
         include_anomalous: bool = False,
         dtype: torch.dtype = torch.float32,
@@ -38,13 +44,14 @@ class Crystal:
     ):
         """
         Initialize a Crystal object.
-        
+
         Parameters:
         -----------
         cif_path: str
             Path to cif file
-        crystal_size: tuple
-            Tuple of integers (n1, n2, n3) specifying crystal size in unit cells
+        crystal_size: tuple, optional
+            Tuple of integers (n1, n2, n3) specifying crystal size in unit cells.
+            If omitted, set it later or let a field loader infer it.
         wavelength: float
             X-ray wavelength in meters
         include_anomalous: bool
@@ -56,7 +63,7 @@ class Crystal:
         """
 
         self.cif_path = cif_path
-        self._crystal_size = tuple(crystal_size)
+        self._crystal_size = tuple(crystal_size) if crystal_size is not None else None
         self.wavelength = wavelength
         self.dtype = dtype
         self.device = device
@@ -76,7 +83,13 @@ class Crystal:
 
         # Rotation matrix tracking: cumulative rotation from original to current orientation
         self._rotation_matrix = torch.eye(3, dtype=self.dtype, device=self.device)
-        
+
+        # Lazy caches for tensors derived from self.structure / self.original_structure
+        self._cached_lattice_vectors = None
+        self._cached_original_lattice_vectors = None
+        self._cached_atom_positions = None
+        self._cached_atom_frac_coords = None
+
         # Parse atom types
         try:
             # If oxidation state is given, atom type is stored in element field of each specie
@@ -90,9 +103,6 @@ class Crystal:
 
         # Set global position (default is origin)
         self._position = torch.zeros(3, dtype=self.dtype, device=self.device)
-
-        # Print crystal size
-        self.print_size()
 
     def _parse_cif_file(self):
         """
@@ -126,33 +136,44 @@ class Crystal:
         Includes anomalous scattering if X-ray wavelength is provided
         and self.include_anomalous is True.
         """        
+        coeffs = self._load_atomic_form_factor_coefficients()
+
         # Always get Cromer-Mann coefficients for f0(q)
-        self.coeff_a = torch.zeros((1, self.n_atoms, 4), dtype=self.dtype, device=self.device)
-        self.coeff_b = torch.zeros((1, self.n_atoms, 4), dtype=self.dtype, device=self.device)
-        self.coeff_c = torch.zeros((1, self.n_atoms), dtype=self.dtype, device=self.device)
-        
+        a_np = np.empty((self.n_atoms, 4))
+        b_np = np.empty((self.n_atoms, 4))
+        c_np = np.empty((self.n_atoms,))
+
         # Initialize anomalous scattering arrays
         if self.include_anomalous:
-            self.f_prime = torch.zeros((1, self.n_atoms), dtype=self.dtype, device=self.device)
-            self.f_double_prime = torch.zeros((1, self.n_atoms), dtype=self.dtype, device=self.device)
+            fp_np  = np.empty((self.n_atoms,))
+            fpp_np = np.empty((self.n_atoms,))
             energy = wavelength_to_energy(self.wavelength)
 
-        coeffs = self._load_atomic_form_factor_coefficients()
-        
         for i, atom_type in enumerate(self.atom_types):
             # Get Cromer-Mann coefficients
-            self.coeff_a[:,i] = torch.tensor(coeffs[atom_type][0:-1:2], dtype=self.dtype, device=self.device)
-            self.coeff_b[:,i] = torch.tensor(coeffs[atom_type][1:-1:2], dtype=self.dtype, device=self.device)
-            self.coeff_c[:,i] = torch.tensor(coeffs[atom_type][-1], dtype=self.dtype, device=self.device)
-            
+            a_np[i] = coeffs[atom_type][0:-1:2]
+            b_np[i] = coeffs[atom_type][1:-1:2]
+            c_np[i] = coeffs[atom_type][-1]
+
             # Get anomalous scattering factors if enabled
             if self.include_anomalous:
-                
-                f_prime = xraydb.f1_chantler(atom_type, energy)
-                f_double_prime = xraydb.f2_chantler(atom_type, energy)
-                
-                self.f_prime[:,i] = torch.tensor(f_prime, dtype=self.dtype, device=self.device)
-                self.f_double_prime[:,i] = torch.tensor(f_double_prime, dtype=self.dtype, device=self.device)
+                fp_np[i]  = xraydb.f1_chantler(atom_type, energy)
+                fpp_np[i] = xraydb.f2_chantler(atom_type, energy)
+
+        self.coeff_a = torch.as_tensor(a_np, dtype=self.dtype, device=self.device).unsqueeze(0)
+        self.coeff_b = torch.as_tensor(b_np, dtype=self.dtype, device=self.device).unsqueeze(0)
+        self.coeff_c = torch.as_tensor(c_np, dtype=self.dtype, device=self.device).unsqueeze(0)
+        if self.include_anomalous:
+            self.f_prime        = torch.as_tensor(fp_np,  dtype=self.dtype, device=self.device).unsqueeze(0)
+            self.f_double_prime = torch.as_tensor(fpp_np, dtype=self.dtype, device=self.device).unsqueeze(0)
+
+    def _resolve_wavelength(self, wavelength: Optional[float]) -> float:
+        """Return the explicit wavelength or fall back to self.wavelength."""
+        if wavelength is not None:
+            return wavelength
+        if self.wavelength is None:
+            raise TypeError("The X-ray wavelength must be provided.")
+        return self.wavelength
 
     def _update_rotation_matrix(self):
         """
@@ -184,40 +205,64 @@ class Crystal:
 
     @property
     def crystal_size(self) -> tuple:
+        if self._crystal_size is None:
+            raise RuntimeError(
+                "crystal_size is not set. Pass it to Crystal(...) or let "
+                "ExodusMesh.resample_to_crystal_grid fit it to the simulation box."
+            )
         return self._crystal_size
-    
+
     @crystal_size.setter
     def crystal_size(self, value):
-        self._crystal_size = tuple(value)
-        # Only print if lattice vectors are available
-        if hasattr(self, 'structure'):
-            self.print_size()
+        self._crystal_size = tuple(value) if value is not None else None
         
     @property
     def lattice_vectors(self) -> Tensor:
-        return torch.tensor(self.structure.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
+        if self._cached_lattice_vectors is None:
+            self._cached_lattice_vectors = torch.tensor(
+                self.structure.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device
+            )
+        return self._cached_lattice_vectors
 
     @property
     def original_lattice_vectors(self) -> Tensor:
-        source = getattr(self, 'original_structure', self.structure)
-        return torch.tensor(source.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device)
+        if self._cached_original_lattice_vectors is None:
+            source = getattr(self, 'original_structure', self.structure)
+            self._cached_original_lattice_vectors = torch.tensor(
+                source.lattice.matrix * 1e-10, dtype=self.dtype, device=self.device
+            )
+        return self._cached_original_lattice_vectors
 
     @property
     def rotation_matrix(self) -> Tensor:
         """
-        Cumulative rotation matrix R from original to current crystal orientation,
-        such that L_current = R @ L_original (row-vector convention: L_current = L_original @ R.T).
+        Cumulative rotation matrix R from original to current crystal orientation.
+        With pymatgen's row-vector lattice convention, L_current = L_original @ R.T.
         Identity if no rotation has been applied.
         """
         return self._rotation_matrix
         
     @property
     def atom_positions(self) -> Tensor:
-        return torch.tensor(self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device)
+        if self._cached_atom_positions is None:
+            self._cached_atom_positions = torch.tensor(
+                self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device
+            )
+        return self._cached_atom_positions
 
     @property
     def atom_frac_coords(self) -> Tensor:
-        return torch.tensor(self.structure.frac_coords, dtype=self.dtype, device=self.device)
+        if self._cached_atom_frac_coords is None:
+            self._cached_atom_frac_coords = torch.tensor(
+                self.structure.frac_coords, dtype=self.dtype, device=self.device
+            )
+        return self._cached_atom_frac_coords
+
+    def _invalidate_structure_caches(self):
+        """Drop cached tensors derived from self.structure after a rotation."""
+        self._cached_lattice_vectors = None
+        self._cached_atom_positions = None
+        self._cached_atom_frac_coords = None
     
     @property
     def n_atoms(self) -> int:
@@ -358,12 +403,7 @@ class Crystal:
             Figure of the resulting XRD pattern
         """
 
-        if wavelength is None:
-            if self.wavelength is not None:
-                wavelength = self.wavelength
-            else:
-                raise TypeError("The X-ray wavelength must be provided.")
-            
+        wavelength = self._resolve_wavelength(wavelength)
         calc = XRDCalculator(wavelength=wavelength * 1e10)
         pattern = calc.get_pattern(self.structure)
 
@@ -385,8 +425,9 @@ class Crystal:
                 angles.append(pattern.x[i].item())
                 hkls.append(tuple([int(k) for k in indices]))
             
-        # Save valid reflections
-        self.reflections = dict(zip(hkls, angles))
+        # Save valid reflections as a list of (hkl, angle) pairs so duplicate
+        # hkls (e.g. one peak with multiple equivalent indices) are preserved.
+        self.reflections = list(zip(hkls, angles))
         
         return fig
 
@@ -405,11 +446,11 @@ class Crystal:
         
         # Prepare data for printing
         if sort_by == 'value':
-            items = sorted(self.reflections.items(), key=lambda x: x[1])
+            items = sorted(self.reflections, key=lambda x: x[1])
         elif sort_by == 'hkl':
-            items = sorted(self.reflections.items(), key=lambda x: x[0])
+            items = sorted(self.reflections, key=lambda x: x[0])
         else:
-            items = list(self.reflections.items())
+            items = list(self.reflections)
         
         # Print header
         print(f"{'h':>3} {'k':>3} {'l':>3}  {'2θ (degrees)':>15}")
@@ -435,17 +476,10 @@ class Crystal:
             Target axis ('x', 'y', or 'z')
         """
         
-        # Define target direction vectors
-        target_directions = {
-            'x': np.array([1, 0, 0]),
-            'y': np.array([0, 1, 0]),
-            'z': np.array([0, 0, 1])
-        }
-        
-        if target_axis not in target_directions:
+        if target_axis not in _AXIS_DIRECTIONS:
             raise ValueError("target_axis must be 'x', 'y', or 'z'")
-        
-        target_direction = target_directions[target_axis]
+
+        target_direction = _AXIS_DIRECTIONS[target_axis]
 
         # Save the original structure
         if not hasattr(self, 'original_structure'):
@@ -473,6 +507,7 @@ class Crystal:
             if np.dot(miller_normal, target_direction) > 0:
                 # Already aligned, no rotation needed
                 self.structure = structure
+                self._invalidate_structure_caches()
                 self._update_rotation_matrix()
                 return
             else:
@@ -491,6 +526,7 @@ class Crystal:
         rotated_structure = transformation.apply_transformation(structure)
 
         self.structure = rotated_structure
+        self._invalidate_structure_caches()
         self._update_rotation_matrix()
 
     def misalign_about_axis(self, rotation_angle=0., rotation_axis='y'):
@@ -499,28 +535,22 @@ class Crystal:
         
         Parameters:
         -----------
-        rotation angle : float
+        rotation_angle : float
             Angle in degrees by which to misalign the structure
         rotation_axis : str
             Rotation axis ('x', 'y', or 'z')
         """
 
-        # Define rotation axis vectors
-        rotation_axis_directions = {
-            'x': np.array([1, 0, 0]),
-            'y': np.array([0, 1, 0]),
-            'z': np.array([0, 0, 1])
-        }
-
-        rotation_axis = rotation_axis_directions[rotation_axis]
+        rotation_axis = _AXIS_DIRECTIONS[rotation_axis]
 
         # Save the original structure
         if not hasattr(self, 'original_structure'):
             self.original_structure = self.structure.copy()
-            
+
         # Apply rotation transformation
         transformation = RotationTransformation(rotation_axis, rotation_angle, angle_in_radians=False)
         self.structure = transformation.apply_transformation(self.structure)
+        self._invalidate_structure_caches()
         self._update_rotation_matrix()
 
     def calculate_form_factors(self, q_magnitude: Tensor) -> Tensor:
@@ -567,17 +597,13 @@ class Crystal:
             1/e penetration depth in meters
         """
     
-        if wavelength is None:
-            if self.wavelength is not None:
-                wavelength = self.wavelength
-            else:
-                raise TypeError("The X-ray wavelength must be provided.")
-                    
+        wavelength = self._resolve_wavelength(wavelength)
+
         # Use xraydb's material_mu which handles formula strings
         # material_mu returns mu in 1/cm when density is provided
         mu_cm = xraydb.material_mu(
             self.structure.formula,
-            wavelength_to_energy(self.wavelength),
+            wavelength_to_energy(wavelength),
             density=self.structure.density
         )
         
@@ -788,9 +814,11 @@ class Crystal:
         gamma: float
     ) -> Tensor:
         """
-        Create rotation matrix from Euler angles (ZYX convention).
-        Applies rotations in order: Z, then Y, then X
-        
+        Create rotation matrix R = Rz @ Ry @ Rx from Euler angles.
+        Applied to a column vector v, R @ v rotates about the original X first,
+        then the original Y, then the original Z (extrinsic XYZ, equivalently
+        intrinsic ZYX).
+
         Parameters:
         -----------
         alpha : float
@@ -799,7 +827,7 @@ class Crystal:
             Rotation around Y axis (radians)
         gamma : float
             Rotation around X axis (radians)
-            
+
         Returns:
         --------
         torch.Tensor
@@ -808,8 +836,7 @@ class Crystal:
         Rz = self.rotation_matrix_z(alpha)
         Ry = self.rotation_matrix_y(beta)
         Rx = self.rotation_matrix_x(gamma)
-        
-        # Combine: R = Rz @ Ry @ Rx
+
         return Rz @ Ry @ Rx
 
     def rotation_matrix_axis_angle(
@@ -843,12 +870,12 @@ class Crystal:
         axis = axis / torch.norm(axis)
         
         # Rodrigues' rotation formula
-        kx, ky, kz = axis[0].item(), axis[1].item(), axis[2].item() 
-        K = torch.tensor([
-            [0,   -kz,  ky],
-            [kz,    0, -kx],
-            [-ky,  kx,   0]
-        ], dtype=self.dtype, device=self.device)
+        zero = torch.zeros((), dtype=self.dtype, device=self.device)
+        K = torch.stack([
+            torch.stack([zero,     -axis[2],  axis[1]]),
+            torch.stack([axis[2],   zero,    -axis[0]]),
+            torch.stack([-axis[1],  axis[0],  zero  ]),
+        ])
         
         I = torch.eye(3, dtype=self.dtype, device=self.device)
         
@@ -917,7 +944,8 @@ class Crystal:
             Euler angles (alpha, beta, gamma) in radians for Z, Y, X rotations.
             Used if rotation_matrix is None.
         center : Tuple[float, float, float], optional
-            Center of rotation in voxel coordinates. If None, uses mask center.
+            Center of rotation in voxel coordinates ordered (n1, n2, n3) to
+            match crystal_size. If None, uses mask center.
         mode : str
             Interpolation mode: 'bilinear' (default, actually trilinear in 3D) or 'nearest'
             - 'bilinear': Smooth but may blur edges
@@ -1103,5 +1131,22 @@ class Crystal:
             raise AttributeError("No original mask to reset to.")
 
 def load_displacement_npz(filename, dtype=torch.float32, device='cpu'):
+    """
+    Load a .npz displacement file into a dict of torch tensors.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the .npz file.
+    dtype : torch.dtype
+        Output dtype for the tensors.
+    device : str
+        Output device for the tensors.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        One tensor per array in the .npz, keyed by its array name.
+    """
     data = np.load(filename)
     return {k: torch.tensor(data[k], dtype=dtype, device=device) for k in data}
