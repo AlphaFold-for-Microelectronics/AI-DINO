@@ -81,14 +81,31 @@ class Detector:
         """
         
         if x == 0:
-            return 0
+            return type(x)(0)
         else:
             exponent = np.floor(math.log(abs(x), base))
             scale = base ** (exponent - digits + 1)
             rounded = round(x / scale) * scale
-            
+
             return type(x)(rounded)
         
+    @staticmethod
+    def _rodrigues(v: Tensor, axis: Tensor, sin_a: Tensor, cos_a: Tensor) -> Tensor:
+        """
+        Rodrigues' rotation formula for a unit ``axis``:
+            v_rot = v cos α + (axis × v) sin α + axis (axis · v) (1 − cos α).
+
+        ``axis`` must be a unit vector. ``sin_a`` / ``cos_a`` typically carry
+        per-pixel angles with shape [..., 1] so the result broadcasts to that
+        leading shape.
+        """
+        # torch.linalg.cross requires equal rank — pad axis with leading singleton dims.
+        if axis.ndim < v.ndim:
+            axis = axis.view(*([1] * (v.ndim - axis.ndim)), *axis.shape)
+        cross = torch.linalg.cross(axis, v, dim=-1)
+        dot   = (axis * v).sum(dim=-1, keepdim=True)
+        return v * cos_a + cross * sin_a + axis * dot * (1 - cos_a)
+
     def _create_pixel_grid(self):
         """
         Create a grid of pixel positions and corresponding angles.
@@ -120,14 +137,21 @@ class Detector:
     ) -> Tensor:
         """
         Calculate q vectors for each detector pixel.
-        
+
+        Implements Mokhtar et al. eq. (7): rotate k_f around k_i × k_f by α_i
+        (θ-direction, varies along axis 0), then around k_f − k_i by α_j
+        (φ-direction, varies along axis 1). Axis 1 runs right-to-left
+        (j increases from num_pixels_j-1 down to 0) so the (i, j) → angle map
+        follows a right-handed coordinate system: q_vectors[i, 0, :]
+        corresponds to the +α_j edge and q_vectors[i, -1, :] to the −α_j edge.
+
         Parameters:
         -----------
         incident_wavevector: torch.Tensor
             Wavevector of incident beam
         reflected_wavevector: torch.Tensor
             Wavevector of reflected beam
-            
+
         Returns:
         --------
         torch.Tensor
@@ -155,37 +179,12 @@ class Detector:
         cos_alpha_i = torch.cos(self.alpha_i).unsqueeze(-1)
         sin_alpha_j = torch.sin(self.alpha_j).unsqueeze(-1)
         cos_alpha_j = torch.cos(self.alpha_j).unsqueeze(-1)
-        
-        # Vectorized implementation of the Rodrigues' rotation formula
-        # Step 1: First rotation around scattering_plane_normal
-        
-        # Calculate dot product term (n1 ⋅ k_f) for all pixels (will be the same for all)
-        n1_dot_kf = torch.dot(k_f, scattering_plane_normal)
-        
-        # Calculate components for the first rotation
-        # Expand all components for broadcasting
-        k_f_expanded = k_f.view(1, 1, 3).expand(self.num_pixels_i, self.num_pixels_j, 3)
-        n1_expanded = scattering_plane_normal.view(1, 1, 3).expand(self.num_pixels_i, self.num_pixels_j, 3)
-        
-        # Calculate cross product term (n1 × k_f) for all pixels
-        n1_cross_kf = torch.linalg.cross(n1_expanded, k_f_expanded, dim=2)
-        
-        # Calculate the rotated vectors for all pixels
-        k_r = k_f_expanded * cos_alpha_i + n1_cross_kf * sin_alpha_i + n1_expanded * n1_dot_kf * (1 - cos_alpha_i)
-        
-        # Step 2: Second rotation around in_plane_perp
-        
-        # Expand in_plane_perp for broadcasting
-        n2_expanded = in_plane_perp.view(1, 1, 3).expand(self.num_pixels_i, self.num_pixels_j, 3)
-        
-        # Calculate dot product term (n2 ⋅ k_r) for all pixels (will be the same for all)
-        n2_dot_kr = torch.sum(k_r * n2_expanded, dim=2, keepdim=True)
-        
-        # Calculate cross product term (n2 × k_r) for all pixels
-        n2_cross_kr = torch.linalg.cross(n2_expanded, k_r, dim=2)
-        
-        # Calculate the final rotated vectors
-        k_f_p = k_r * cos_alpha_j + n2_cross_kr * sin_alpha_j + n2_expanded * n2_dot_kr * (1 - cos_alpha_j)
+
+        # Two Rodrigues rotations per pixel (Mokhtar et al. eq. (7)):
+        # first rotate k_f around the scattering plane normal by α_i, then
+        # rotate the result around (k_f − k_i) by α_j.
+        k_r   = self._rodrigues(k_f, scattering_plane_normal, sin_alpha_i, cos_alpha_i)
+        k_f_p = self._rodrigues(k_r, in_plane_perp,           sin_alpha_j, cos_alpha_j)
         
         # Scale by k magnitude to get actual wave vectors
         k_i_scaled = k_i * self.k_magnitude
@@ -201,41 +200,45 @@ class Detector:
     def calculate_fringe_spacing(self, sample_volume: float) -> float:
         """
         Calculate the fringe spacing given the sample size.
-        
+
+        Uses w_f ≈ 2π / V^(1/3) (Mokhtar et al. §2.2.2), which takes V^(1/3) as
+        the characteristic linear size and is therefore an isotropic
+        approximation — exact for cubic samples, an average for elongated ones.
+
         Parameters:
         -----------
         sample_volume: float
             Volume of sample in meters^3
-            
+
         Returns:
         --------
         float
             Fringe spacing in 1 / meters
         """
-        
-        # Calculate fringe spacing based on sample size using w_f ≈ 2π/V^(1/3) 
-        
+
         return 2 * torch.pi / sample_volume ** (1/3)
-        
+
     def calculate_oversampling_ratio(self, sample_volume: float) -> float:
         """
         Calculate the oversampling ratio β attained with the given experimental parameters and sample size.
-        
+
+        Uses Equation 8 of Mokhtar et al. with V^(1/3) as the characteristic
+        linear size; see calculate_fringe_spacing for the isotropic assumption.
+
         Parameters:
         -----------
         sample_volume: float
             Volume of sample in meters^3
-            
+
         Returns:
         --------
         float
             Oversampling ratio
         """
-        
-        # Calculate oversampling ratio using Equation 8 of Mokhtar et al.
+
         fringe_spacing = self.calculate_fringe_spacing(sample_volume)
         oversampling_ratio = fringe_spacing * self.distance / (2 * self.pixel_size * self.k_magnitude)
-        
+
         return oversampling_ratio
         
     def calculate_resolution(self) -> float:
@@ -268,8 +271,9 @@ class Detector:
             Figure of the resulting plot
         """
         
-        vmax = [Detector.round_in_base(_.item()) for _ in q_vectors.abs().amax(dim=(0,1))]
-        vmin = [Detector.round_in_base(_.item()) for _ in q_vectors.amin(dim=(0,1))]
+        # Reduce on device, then sync each axis range once to Python list.
+        vmax = [Detector.round_in_base(v) for v in q_vectors.abs().amax(dim=(0,1)).cpu().tolist()]
+        vmin = [Detector.round_in_base(v) for v in q_vectors.amin(dim=(0,1)).cpu().tolist()]
 
         cmap, norm, sm = [], [], []
         for i in range(3):

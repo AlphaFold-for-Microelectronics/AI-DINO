@@ -83,62 +83,47 @@ class ODE(nn.Module):
     def get_batch(self, t, y, batch_time, batch_size):
         """
         Create batches from trajectory data.
-        
-        This method samples random subsequences from the trajectory data to create training batches.
-        When batch_time equals T, it returns full trajectories for randomly sampled initial conditions.
-        
+
+        Samples (start_time, trajectory) pairs uniformly with replacement;
+        collisions are negligible at typical sizes. Handles both subsequence
+        sampling (batch_time < T) and full-trajectory sampling (batch_time == T)
+        with a single code path.
+
         Parameters
         ----------
         t : torch.Tensor
-            Time points. Shape: (T,).
+            Time points. Shape: (T,). Assumed uniformly spaced — t_batch is
+            returned as t[:batch_time] regardless of the sampled start, which
+            is only correct for autonomous ODEs with constant time increments.
         y : torch.Tensor
-            Trajectory data. Shape: (T, M, ...) where:
-            - T: number of time points
-            - M: number of trajectories
+            Trajectory data. Shape: (T, M, ...).
         batch_time : int
-            Length of each batch sequence (number of time steps).
-            If batch_time == T, returns full trajectories.
+            Length of each batch subsequence. Must satisfy 1 <= batch_time <= T.
         batch_size : int
-            Number of sequences in the batch.
-        
+            Number of subsequences in the batch.
+
         Returns
         -------
         t_batch : torch.Tensor
             Time points for the batch. Shape: (batch_time,).
         y0_batch : torch.Tensor
-            Initial conditions for each batch sequence. Shape: (batch_size, ...).
+            Initial conditions for each subsequence. Shape: (batch_size, ...).
         y_batch : torch.Tensor
             Batch trajectory data. Shape: (batch_time, batch_size, ...).
         """
-        
         T, M = y.shape[:2]
-        t_batch = t[:batch_time]
-    
-        if batch_time == T:
-            # Return full trajectories for randomly sampled initial conditions
-            replace = batch_size > M  # Allow replacement if we need more samples than available trajectories
-            traj_indices = np.random.choice(M, batch_size, replace=replace)
-            
-            y0_batch = y[0, traj_indices]  # Initial conditions from selected trajectories
-            y_batch = y[:, traj_indices]   # Full trajectories for selected trajectories
-            
-        else:
-            # Sample subsequences of trajectories for randomly sampled initial conditions
-            # Generate all possible (time_start, trajectory_index) combinations
-            c = [[i, j] for i in range(T - batch_time) for j in range(M)]
-            sampled_indices = np.random.choice(len(c), batch_size, replace=False)
-            
-            # Extract time and trajectory indices
-            time_indices = [c[i][0] for i in sampled_indices]
-            traj_indices = [c[i][1] for i in sampled_indices]
-            
-            # Extract initial conditions
-            y0_batch = y[time_indices, traj_indices]
-            
-            # Extract trajectory subsequences
-            batch_indices = torch.arange(batch_time)[:, None] + torch.tensor(time_indices)[None, :]
-            y_batch = y[batch_indices, traj_indices]
-        
+
+        time_indices = np.random.randint(0, T - batch_time + 1, batch_size)
+        traj_indices = np.random.randint(0, M, batch_size)
+
+        t_batch  = t[:batch_time]
+        y0_batch = y[time_indices, traj_indices]
+        batch_indices = (
+            torch.arange(batch_time, device=y.device)[:, None]
+            + torch.as_tensor(time_indices, device=y.device)[None, :]
+        )
+        y_batch = y[batch_indices, traj_indices]
+
         return t_batch, y0_batch, y_batch
 
 class Kuramoto3D(ODE):
@@ -430,12 +415,11 @@ class Kuramoto3D(ODE):
         d = int(np.ceil(self.cutoff_factor * self.power_scale))
         x, r = self._create_spatial_grid(d)
         
-        # Avoid division by zero at r=0
+        # Avoid division by zero at r=0: replace r=0 with inf so that
+        # pow(inf, -alpha) = 0 zeros the center for the typical alpha > 0 case.
         r_safe = torch.where(r > 0, r, torch.inf)
         kernel = torch.pow(r_safe, -self.power_alpha)
-        kernel[r == 0] = 0  # Set center and avoid infinities
-        kernel[torch.isinf(kernel)] = 0
-        
+
         return self._normalize_kernel(kernel)
     
     def exponential_decay_kernel(self):
@@ -553,43 +537,40 @@ class Kuramoto3D(ODE):
         Returns
         -------
         torch.Tensor
-            Initial phase configuration of shape (M, 1, Nx*Ny*Nz) with phases
+            Initial phase configuration of shape (M, 1, Nx, Ny, Nz) with phases
             uniformly distributed in [0, 2π].
         """
         torch.manual_seed(seed)
-        return 2 * torch.pi * torch.rand((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype).flatten(start_dim=-3)
-    
+        return 2 * torch.pi * torch.rand((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype)
+
     def forward(self, t, y):
         """
         Compute the time derivative of the phase configuration (ODE right-hand side).
-        
+
         Implements the Kuramoto dynamics:
         dθ/dt = K * Σ_j G(r_ij) * sin(θ_j - θ_i)
-        
+
         Parameters
         ----------
         t : float
             Current time.
         y : torch.Tensor
-            Current phase configuration of shape (M, 1, Nx*Ny*Nz) where M is batch size.
-        
+            Current phase configuration of shape (M, 1, Nx, Ny, Nz).
+
         Returns
         -------
         torch.Tensor
             Time derivatives of phases with same shape as input y.
-            
+
         Notes
         -----
         The convolution operation efficiently computes the spatial coupling
         using the precomputed kernel. The computation uses the identity:
         sin(θ_j - θ_i) = sin(θ_j)cos(θ_i) - cos(θ_j)sin(θ_i)
         """
-        y = y.view((-1, 1, self.Nx, self.Ny, self.Nz))
         cosy = torch.cos(y)
         siny = torch.sin(y)
-        conv_cosy = self.conv(cosy)
-        conv_siny = self.conv(siny)
-        return (cosy * conv_siny - siny * conv_cosy).flatten(start_dim=-3)
+        return cosy * self.conv(siny) - siny * self.conv(cosy)
 
 
 class KuramotoQuasi2D(ODE):
@@ -768,15 +749,14 @@ class KuramotoQuasi2D(ODE):
         Returns
         -------
         torch.Tensor
-            Initial phase configuration of shape (M, 1, Nx*Ny*Nz) with phases
+            Initial phase configuration of shape (M, 1, Nx, Ny, Nz) with phases
             uniformly distributed in [0, 2π], identical across all z-slices.
         """
         torch.manual_seed(seed)
 
         # Generate 2D initial state and replicate across z-dimension
         y0_2d = 2 * np.pi * torch.rand((M, 1, self.Nx, self.Ny), dtype=self.dtype)
-        y0 = y0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
-        return y0.flatten(start_dim=-3)
+        return y0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
 
     def forward(self, t, y):
         """
@@ -791,7 +771,7 @@ class KuramotoQuasi2D(ODE):
         t : float
             Current time.
         y : torch.Tensor
-            Current phase configuration of shape (M, 1, Nx*Ny*Nz).
+            Current phase configuration of shape (M, 1, Nx, Ny, Nz).
 
         Returns
         -------
@@ -803,12 +783,9 @@ class KuramotoQuasi2D(ODE):
         Uses the trigonometric identity:
         sin(θ_j - θ_i) = sin(θ_j)cos(θ_i) - cos(θ_j)sin(θ_i)
         """
-        y = y.view((-1, 1, self.Nx, self.Ny, self.Nz))
         cosy = torch.cos(y)
         siny = torch.sin(y)
-        conv_cosy = self.conv(cosy)
-        conv_siny = self.conv(siny)
-        return (cosy * conv_siny - siny * conv_cosy).flatten(start_dim=-3)
+        return cosy * self.conv(siny) - siny * self.conv(cosy)
 
         
 class CahnHilliard3D(ODE):
@@ -918,34 +895,31 @@ class CahnHilliard3D(ODE):
         Returns
         -------
         torch.Tensor
-            Initial state tensor of shape (M, 1, Nx*Ny*Nz).
+            Initial state tensor of shape (M, 1, Nx, Ny, Nz).
         """
         torch.manual_seed(seed)
-        return mean + sigma * torch.randn((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype).flatten(start_dim=-3) 
-        
+        return mean + sigma * torch.randn((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype)
+
     def forward(self, t, c):
         """
         Compute the time derivative for the Cahn-Hilliard equation.
-        
+
         This method implements the 3D Cahn-Hilliard equation:
         dc/dt = D * ∇²(c³ - c - γ * ∇²c)
-        
+
         Parameters
         ----------
         t : torch.Tensor
             Current time.
         c : torch.Tensor
-            Current state vector of shape (M, 1, Nx*Ny*Nz) where M is batch size
-            and Nx*Ny*Nz represents the flattened 3D spatial grid.
-            
+            Current state of shape (M, 1, Nx, Ny, Nz).
+
         Returns
         -------
         torch.Tensor
-            Time derivative dc/dt with same shape as input c, representing
-            the rate of change according to the Cahn-Hilliard dynamics.
+            Time derivative dc/dt with same shape as input c.
         """
-        c = c.view(-1, 1, self.Nx, self.Ny, self.Nz)
-        return self.D * self.laplacian(c ** 3 - c - self.g * self.laplacian(c)).flatten(start_dim=-3)
+        return self.D * self.laplacian(c ** 3 - c - self.g * self.laplacian(c))
 
         
 class CahnHilliardQuasi2D(ODE):
@@ -1056,38 +1030,33 @@ class CahnHilliardQuasi2D(ODE):
         Returns
         -------
         torch.Tensor
-            Initial state tensor of shape (M, Nx*Ny*Nz) with random noise,
+            Initial state tensor of shape (M, 1, Nx, Ny, Nz) with random noise,
             identical across all z-slices.
         """
         torch.manual_seed(seed)
-        
-        # Generate 2D initial state
+
+        # Generate 2D initial state and replicate across z-dimension
         c0_2d = mean + sigma * torch.randn((M, 1, self.Nx, self.Ny), dtype=self.dtype)
-        
-        # Replicate across z-dimension
-        c0 = c0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
-        return c0.flatten(start_dim=-3)
-        
+        return c0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
+
     def forward(self, t, c):
         """
         Compute the time derivative for the quasi-2D Cahn-Hilliard equation.
-        
+
         This method implements the Cahn-Hilliard equation with 2D spatial operators
         applied independently to each z-slice:
         dc/dt = D * ∇²(c³ - c - γ * ∇²c)
-        
+
         Parameters
         ----------
         t : torch.Tensor
             Current time.
         c : torch.Tensor
-            Current state vector of shape (M, Nx*Ny*Nz) where M is batch size.
-            
+            Current state of shape (M, 1, Nx, Ny, Nz).
+
         Returns
         -------
         torch.Tensor
-            Time derivative dc/dt with same shape as input c, representing
-            the rate of change according to the Cahn-Hilliard dynamics.
+            Time derivative dc/dt with same shape as input c.
         """
-        c = c.view(-1, 1, self.Nx, self.Ny, self.Nz)
-        return self.D * self.laplacian(c ** 3 - c - self.g * self.laplacian(c)).flatten(start_dim=-3)
+        return self.D * self.laplacian(c ** 3 - c - self.g * self.laplacian(c))
