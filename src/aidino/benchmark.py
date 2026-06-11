@@ -1328,18 +1328,16 @@ def plot_sweep(
             title=panel_title,
         )
         if not is_left:
+            # Hide both major and minor tick labels — matplotlib labels
+            # minor ticks on log axes whose range spans less than a decade,
+            # and those would otherwise leak through and crowd the panel gap.
             plt.setp(ax.get_yticklabels(), visible=False)
+            plt.setp(ax.get_yticklabels(minor=True), visible=False)
 
     # Format twin axes: color spine + major/minor ticks on EVERY panel;
     # show tick labels and y-label only on the rightmost (axes are shared).
     if y_twin_list and twin_axes:
-        # When multiple y_twin fields are shown, leave the y-label generic
-        # ('$\chi^2$ error') since the legend already disambiguates each
-        # field via linestyle.
-        if len(y_twin_list) == 1:
-            twin_ylabel = _Y_LABELS.get(y_twin_list[0], y_twin_list[0])
-        else:
-            twin_ylabel = r'$\chi^2$ error'
+        twin_ylabel = r'$\chi^2$ error'
         for i, ax_t in enumerate(twin_axes):
             is_rightmost = (i == n_facets - 1)
             if log_y_twin:
@@ -1356,6 +1354,7 @@ def plot_sweep(
                 ax_t.yaxis.offsetText.set_color(TWIN_COLOR)
             else:
                 plt.setp(ax_t.get_yticklabels(), visible=False)
+                plt.setp(ax_t.get_yticklabels(minor=True), visible=False)
 
     # Build the shared legend: grad categories (colored lines), then methods
     # (shaped markers in neutral black), then twin entry, then vlines.
