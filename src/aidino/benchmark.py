@@ -7,6 +7,7 @@ fields and a Gaussian-beam mask.
 
 Tests provided:
     - test_method_vs_supercells      (time + memory, both methods)
+    - test_method_vs_batch_size      (time + memory vs frames/call, both methods)
     - test_direct_vs_qbatch          (time + memory, direct method)
     - test_direct_error_vs_supercell (time + memory + chi^2_0, direct)
     - test_fft_error_vs_oversampling (time + memory + chi^2_0 + chi^2, FFT)
@@ -249,11 +250,14 @@ class BenchSetup:
     k_i: Tensor
     k_f: Tensor
     bragg_vector: Tensor
-    base_continuum: Tensor           # [1, n1, n2, n3, 3], unit-cell resolution
-    base_sublattice: Tensor          # [1, n1, n2, n3, n_atoms, 3], frac coords
-    base_mask: Tensor                # [1, n1, n2, n3], unit-cell resolution
+    base_continuum: Tensor           # [B, n1, n2, n3, 3], unit-cell resolution
+    base_sublattice: Tensor          # [B, n1, n2, n3, n_atoms, 3], frac coords
+    base_mask: Tensor                # [1, n1, n2, n3], shared across the batch
     crystal_size: Tuple[int, int, int]
     supercell_size_default: Tuple[int, int, int]
+    batch_size: int                  # leading batch dim of base_continuum/sublattice
+    continuum_scale_m: float         # retained so tests can rebuild fields at other B
+    sublattice_scale_frac: float
     device: torch.device
     dtype: torch.dtype
 
@@ -270,6 +274,7 @@ def build_setup(
     distance: float = 0.1,
     wavelength: float = 1.5406e-10,
     fwhm_beam: float = 20e-9,
+    batch_size: int = 1,
     continuum_scale_m: float = 1e-11,   # ~0.1 angstrom per supercell, mild
     sublattice_scale_frac: float = 0.01,  # 1% of a unit cell, mild
     seed: int = 0,
@@ -280,6 +285,10 @@ def build_setup(
     Build a synthetic BaTiO3 scenario with random continuum + sublattice
     displacement fields at unit-cell resolution (downsampling lets every
     test pick its own supercell_size without rebuilding the fields).
+
+    batch_size controls the leading "frame" dimension of the displacement
+    fields. Set >1 to simulate processing N frames simultaneously per
+    forward call (e.g., for trajectory batching).
 
     The displacements are seeded so different runs are bit-identical.
     """
@@ -323,12 +332,14 @@ def build_setup(
     # Use a Generator so seeded runs are bit-identical across sessions.
     gen = torch.Generator(device=device).manual_seed(seed)
     base_continuum = continuum_scale_m * torch.randn(
-        (1, n1, n2, n3, 3), generator=gen, dtype=dtype, device=device,
+        (batch_size, n1, n2, n3, 3), generator=gen, dtype=dtype, device=device,
     )
     base_sublattice = sublattice_scale_frac * torch.randn(
-        (1, n1, n2, n3, n_atoms, 3), generator=gen, dtype=dtype, device=device,
+        (batch_size, n1, n2, n3, n_atoms, 3), generator=gen, dtype=dtype, device=device,
     )
 
+    # Mask stays at batch=1 — beam profile is the same across frames, and
+    # aidino broadcasts it over the inferred batch dim of the other inputs.
     base_mask = beam.profile
 
     return BenchSetup(
@@ -345,6 +356,9 @@ def build_setup(
         base_mask=base_mask,
         crystal_size=crystal_size,
         supercell_size_default=supercell_size,
+        batch_size=batch_size,
+        continuum_scale_m=continuum_scale_m,
+        sublattice_scale_frac=sublattice_scale_frac,
         device=device,
         dtype=dtype,
     )
@@ -375,13 +389,16 @@ def make_data_inputs(
     *,
     include_sublattice: bool,
     grad_mode: str,
+    batch_size: Optional[int] = None,
 ) -> dict:
     """
     Build the data-input kwargs for calculate_supercell_scattering.
 
-    Clones the base tensors so requires_grad can be flipped per-call without
-    leaking grad state into the next config. Raises if a sublattice grad mode
-    is requested with include_sublattice=False.
+    When batch_size is None (default), clones the base tensors from setup
+    as-is (so the batch dim matches setup.batch_size). When given, builds
+    fresh random tensors at the requested batch_size — used by sweeps that
+    vary the batch dimension. Raises if a sublattice grad mode is requested
+    with include_sublattice=False.
     """
     grad_target, _ = _parse_grad_mode(grad_mode)
     if grad_target == 'sublattice' and not include_sublattice:
@@ -391,13 +408,28 @@ def make_data_inputs(
 
     inputs: dict = {'mask': setup.base_mask}
 
-    continuum = setup.base_continuum.clone()
+    if batch_size is None:
+        continuum = setup.base_continuum.clone()
+    else:
+        n1, n2, n3 = setup.crystal_size
+        continuum = setup.continuum_scale_m * torch.randn(
+            (batch_size, n1, n2, n3, 3),
+            dtype=setup.dtype, device=setup.device,
+        )
     if grad_target == 'continuum':
         continuum.requires_grad_(True)
     inputs['continuum_displacement'] = continuum
 
     if include_sublattice:
-        sublattice = setup.base_sublattice.clone()
+        if batch_size is None:
+            sublattice = setup.base_sublattice.clone()
+        else:
+            n1, n2, n3 = setup.crystal_size
+            n_atoms = setup.crystal.n_atoms
+            sublattice = setup.sublattice_scale_frac * torch.randn(
+                (batch_size, n1, n2, n3, n_atoms, 3),
+                dtype=setup.dtype, device=setup.device,
+            )
         if grad_target == 'sublattice':
             sublattice.requires_grad_(True)
         inputs['sublattice_displacement'] = sublattice
@@ -565,6 +597,103 @@ def test_method_vs_supercells(
                     if verbose:
                         tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
                         print(f"  [n_sc={n_sc}, {method}, sub={include_sub}, {grad_mode}] {tag}")
+
+    pbar.close()
+    return results
+
+
+def test_method_vs_batch_size(
+    setup: BenchSetup,
+    batch_sizes: Sequence[int],
+    *,
+    methods: Sequence[str] = ('direct', 'fft'),
+    include_sublattice_options: Sequence[bool] = (False, True),
+    grad_modes: Optional[Sequence[str]] = None,
+    supercell_size: Optional[Tuple[int, int, int]] = None,
+    q_batch_size: int = 64,
+    fft_oversampling: Optional[int] = None,
+    n_repeats: int = 3,
+    verbose: bool = False,
+) -> List[BenchmarkResult]:
+    """
+    Sweep `batch_sizes` (leading "frame" dimension) for both methods at
+    fixed supercell_size. Records time and peak additional GPU memory per
+    (include_sublattice, grad_mode, method, batch_size). Useful for sizing
+    workloads where many frames (e.g., timesteps) are processed per call,
+    and for seeing how GPU saturation shifts the optimal q_batch_size.
+    """
+    sc_size = supercell_size or setup.supercell_size_default
+    n_sc = _n_supercells(setup.crystal_size, sc_size)
+    M = fft_oversampling or recommend_fft_oversampling(setup)
+    results: List[BenchmarkResult] = []
+
+    total = sum(
+        len(batch_sizes) * len(methods) *
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        for s in include_sublattice_options
+    )
+    pbar = tqdm(total=total, disable=verbose,
+                desc='method_vs_batch_size', bar_format=_BAR_FORMAT)
+
+    for include_sub in include_sublattice_options:
+        modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
+        for B in batch_sizes:
+            for method in methods:
+                for grad_mode in modes:
+                    pbar.update(1)
+                    # Release the previous iteration's amplitude (+ any retained
+                    # autograd graph) so it doesn't sit in GPU memory through
+                    # the next config's measurement.
+                    _amp = None
+                    _, do_bwd = _parse_grad_mode(grad_mode)
+                    _cleanup(setup.device)
+                    try:
+                        data = make_data_inputs(
+                            setup, include_sublattice=include_sub,
+                            grad_mode=grad_mode, batch_size=B,
+                        )
+                    except ValueError:
+                        continue
+
+                    call_kwargs = {**data}
+                    if method == 'direct':
+                        call_kwargs['q_batch_size'] = q_batch_size
+                    elif method == 'fft':
+                        call_kwargs['method'] = 'fft'
+                        call_kwargs['bragg_vector'] = setup.bragg_vector
+                        call_kwargs['fft_oversampling'] = M
+
+                    def call_fn():
+                        return setup.simulator.calculate_supercell_scattering(
+                            setup.q_vectors, sc_size, **call_kwargs
+                        )
+
+                    elapsed, peak, _amp = measure_call(
+                        call_fn,
+                        backward=do_bwd,
+                        no_grad=(grad_mode == 'no_grad'),
+                        device=setup.device,
+                        n_repeats=n_repeats,
+                    )
+                    oom = math.isnan(elapsed)
+                    results.append(BenchmarkResult(
+                        test_name='method_vs_batch_size',
+                        swept_param='batch_size',
+                        swept_value=int(B),
+                        method=method,
+                        include_sublattice=include_sub,
+                        grad_mode=grad_mode,
+                        elapsed_time_s=elapsed if not oom else float('nan'),
+                        peak_memory_gb=peak if not oom else float('nan'),
+                        n_supercells=n_sc,
+                        fft_oversampling=M if method == 'fft' else None,
+                        oom=oom,
+                        extra={'supercell_size': list(sc_size),
+                               'q_batch_size': q_batch_size if method == 'direct' else None},
+                    ))
+                    if verbose:
+                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                        print(f"  [B={B}, {method}, sub={include_sub}, {grad_mode}] {tag}")
 
     pbar.close()
     return results
@@ -939,6 +1068,7 @@ _X_LABELS = {
     'q_batch_size': r'$q$-batch size',
     'supercell_size_product': 'Unit cells per supercell',
     'fft_oversampling': r'FFT oversampling factor',
+    'batch_size': 'Batch size (frames per call)',
 }
 
 # Grad-mode category for plotting. The continuum/sublattice distinction is
