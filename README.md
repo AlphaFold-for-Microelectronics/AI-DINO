@@ -7,9 +7,14 @@ AI-DINO is a PyTorch-based forward modeling framework for simulating Bragg Coher
 
 ## Overview
 
-The scattering calculation is based on the supercell factorization approach of [Mokhtar et al., *J. Phys. Commun.* **6**, 055003 (2022)](https://doi.org/10.1088/2399-6528/ac6ab0), which avoids the fixed-grid constraint of Fourier-transform-based methods and reduces computation time by several orders of magnitude. This enables full differentiability with respect to arbitrary atomic and lattice displacement fields — a requirement for gradient-based optimization and phase retrieval.
+AI-DINO provides two interchangeable scattering methods exposed by the same `BraggCoherentDiffraction` API, both end-to-end differentiable in PyTorch:
 
-AI-DINO extends the Mokhtar et al. framework in several ways:
+- **Direct method** — implements the supercell factorization of [Mokhtar et al., *J. Phys. Commun.* **6**, 055003 (2022)](https://doi.org/10.1088/2399-6528/ac6ab0). Evaluates the modified per-supercell structure factor at every detector q-vector. Exact within the supercell approximation; memory scales as `n_pixels × n_supercells × n_atoms`.
+- **FFT method** — uses the approximation `F_s(G + Δq) ≈ F_s(G)` (valid when the structure factor varies slowly across the detector window), evaluates `F_s` once at the Bragg vector, computes a single zero-padded 3D FFT over supercell positions, and interpolates to the detector grid. Much faster and lower memory at typical detector sizes; accuracy depends on the FFT oversampling factor `M`. The `benchmark` module includes tools to compare the two methods on time, memory, and chi-squared error across configurations.
+
+Both calculations are fully differentiable with respect to the displacement fields and beam mask, enabling gradient-based optimization and integration with machine-learning workflows.
+
+On top of the base supercell formulation, AI-DINO adds:
 
 - **Continuum displacement fields** — per-supercell rigid shifts (e.g. from phase-field simulations) are incorporated as additional supercell-level phase factors, capturing the BCDI phase signal without modifying the structure factor
 - **Sublattice displacements** — per-atom, per-supercell shifts (e.g. ferroelectric off-centering from polarization fields via Born effective charges) enter the modified per-supercell structure factor
@@ -22,18 +27,19 @@ AI-DINO extends the Mokhtar et al. framework in several ways:
 | Module | Description |
 |---|---|
 | `sample.py` | `Crystal` class — parses CIF files, manages lattice vectors, atom positions, form factors, and crystal orientation |
-| `diffraction.py` | `BraggCoherentDiffraction` class — supercell scattering calculations with optional displacement, strain, and mask fields |
+| `diffraction.py` | `BraggCoherentDiffraction` class — direct and FFT scattering calculations with optional displacement, strain, and mask fields |
 | `exodus.py` | `ExodusMesh` / `CrystalGrid` — Exodus II file parsing and resampling onto the diffraction supercell grid |
 | `beam.py` | X-ray beam profile generation |
 | `detector.py` | Detector geometry and q-vector calculation |
 | `xpcs.py` | Two-time intensity correlation for XPCS analysis |
 | `xray_utils.py` | Utility functions (wavelength/energy conversion, etc.) |
+| `benchmark.py` | Sweeps comparing the direct and FFT methods on time, memory, and chi² across configurations |
 
 ## Installation
 
 ### 1. Create an isolated environment (conda or venv)
 
-With conda (recommended for CUDA users — pulls in the right CUDA runtime):
+With conda (recommended for CUDA users; pulls in the right CUDA runtime):
 
 ```bash
 conda create -n aidino python=3.11
@@ -50,14 +56,14 @@ source .venv/bin/activate
 ### 2. Install PyTorch first (CUDA users only)
 
 For GPU support, install PyTorch *before* aidino using the official
-command from https://pytorch.org/get-started/locally/ — the correct wheel
+command from https://pytorch.org/get-started/locally/; the correct wheel
 depends on your CUDA toolkit version. Example for CUDA 12.1:
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Skip this step for a CPU-only install — `pip install -e .` will pull
+Skip this step for a CPU-only install; `pip install -e .` will pull
 torch from PyPI in step 3.
 
 ### 3. Install aidino in editable mode
