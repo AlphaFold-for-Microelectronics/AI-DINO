@@ -121,13 +121,20 @@ class BraggCoherentDiffraction:
             mask_sc = self._downsample_to_supercell(mask, supercell_size, n_trailing=0)
             supercell_mask_flat = mask_sc.flatten(start_dim=1)
 
-        # Preprocess continuum displacement to [batch_size, n_supercells, 3]
+        # Preprocess continuum displacement to [batch_size, n_supercells, 3].
+        # 5D unit-cell-resolution input is averaged into the supercell grid,
+        # matching the behavior of mask and sublattice_displacement.
         continuum_displacement_flat = None
         if continuum_displacement is not None:
-            if continuum_displacement.ndim not in (3, 5):
+            if continuum_displacement.ndim == 5:
+                continuum_displacement = self._downsample_to_supercell(
+                    continuum_displacement, supercell_size, n_trailing=1,
+                )
+            elif continuum_displacement.ndim != 3:
                 raise ValueError(
                     f"continuum_displacement has ndim {continuum_displacement.ndim}, "
-                    f"expected 5 ([B, n1, n2, n3, 3]) or 3 ([B, n_supercells, 3])."
+                    f"expected 5 ([B, n1, n2, n3, 3] or [B, n_sc1, n_sc2, n_sc3, 3]) "
+                    f"or 3 ([B, n_supercells, 3])."
                 )
             continuum_displacement_flat = continuum_displacement.reshape(
                 continuum_displacement.shape[0], -1, 3
@@ -419,9 +426,11 @@ class BraggCoherentDiffraction:
             n1, n2, n3, 3, 3] or [batch_size, n_sc1, n_sc2, n_sc3, 3, 3].
             Combines with sublattice_displacement via δr_m^strain = f_m · δL.
         continuum_displacement : torch.Tensor, optional
-            Per-supercell rigid Cartesian shift, shape [batch_size, n_sc1,
-            n_sc2, n_sc3, 3] or [batch_size, n_supercells, 3]. Does NOT
-            trigger the per-supercell path (it's just an outer phase factor).
+            Per-supercell rigid Cartesian shift, shape [batch_size, n1, n2,
+            n3, 3], [batch_size, n_sc1, n_sc2, n_sc3, 3], or [batch_size,
+            n_supercells, 3]. Unit-cell-resolution input is averaged into the
+            supercell grid. Does NOT trigger the per-supercell path (it's
+            just an outer phase factor).
         mask : torch.Tensor, optional
             Per-supercell weight mask, shape [batch_size, n1, n2, n3] or
             [batch_size, n_sc1, n_sc2, n_sc3]. Unit-cell-resolution masks are

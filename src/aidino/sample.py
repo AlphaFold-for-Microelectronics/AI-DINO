@@ -615,13 +615,18 @@ class Crystal:
         
         return penetration_depth
 
-    def create_displacement_field(self, batch_size=1, supercell_size=(1,1,1), scaling_factor=1., displacement_dict=None):
+    def create_displacement_field(self, batch_size=1, supercell_size=(1,1,1), scaling_factor=0.01, displacement_dict=None):
         """
         Generate a displacement field for atoms in a crystal structure.
-    
+
         Creates either a deterministic displacement field from a provided dictionary,
         or a random displacement field scaled by a given factor.
-    
+
+        All displacement values are in **unit-cell fractional coordinates** (multiples
+        of the lattice vectors), matching the input convention of
+        ``BraggCoherentDiffraction.calculate_supercell_scattering``. A value of
+        ``(0.01, 0, 0)`` means "shift this atom by 1% of the **a** lattice vector".
+
         Parameters
         ----------
         batch_size : int, optional
@@ -630,15 +635,16 @@ class Crystal:
             Size of the supercell in each dimension (x, y, z). The crystal size is
             divided by this value per axis to determine the field shape. Default is (1, 1, 1).
         scaling_factor : float, optional
-            Scaling factor applied to the random displacement field. Controls the
-            maximum magnitude of random displacements. Only used when
-            `displacement_dict` is None. Default is 1.0.
+            Maximum magnitude of random displacements, in **fractional lattice
+            coordinates**. Random draws are uniform on ``[-scaling_factor,
+            scaling_factor]`` per Cartesian component. Only used when
+            ``displacement_dict`` is None. Default is 0.01 (1% of a lattice vector).
         displacement_dict : dict or None, optional
-            Dictionary mapping element symbols (str) to displacement vectors. If
-            provided, each atom type listed in the dictionary is assigned its
-            corresponding fixed displacement vector, and all other atoms receive
-            zero displacement. If None, displacements are drawn randomly from a
-            uniform distribution on [-scaling_factor, scaling_factor]. Default is None.
+            Dictionary mapping element symbols (str) to displacement vectors **in
+            fractional lattice coordinates**. If provided, each atom type listed
+            in the dictionary is assigned its corresponding fixed displacement
+            vector, and all other atoms receive zero displacement. If None,
+            displacements are drawn randomly as above. Default is None.
     
         Returns
         -------

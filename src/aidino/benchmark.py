@@ -1,0 +1,1275 @@
+"""
+Benchmark utilities for the direct vs FFT BCDI scattering methods.
+
+Designed to be imported from benchmark.ipynb, which builds a synthetic
+BaTiO3 cubic crystal with random continuum + sublattice displacement
+fields and a Gaussian-beam mask.
+
+Tests provided:
+    - test_method_vs_supercells      (time + memory, both methods)
+    - test_direct_vs_qbatch          (time + memory, direct method)
+    - test_direct_error_vs_supercell (time + memory + chi^2_0, direct)
+    - test_fft_error_vs_oversampling (time + memory + chi^2_0 + chi^2, FFT)
+
+chi^2_0 is the error vs the ground-truth direct@(1,1,1) intensity (total
+approximation error — supercell + FFT combined). chi^2 (test 4 only) is the
+error vs direct@same-supercell — the pure FFT approximation error within
+the chosen supercell. The gap between chi^2_0 and chi^2 at large oversampling
+reveals the supercell-approximation floor.
+
+Each test loops over `include_sublattice` (False/True) and `grad_mode`.
+By default the grad_modes are (no_grad, fwd, bwd) paired with the
+relevant input — continuum_displacement when include_sublattice=False,
+sublattice_displacement when include_sublattice=True. OOM is trapped so
+a partial sweep records `oom=True` instead of crashing. For tests 3 & 4,
+chi^2 quantities are computed only under no_grad (independent of grad_mode).
+
+Results serialize as JSON in benchmark_results/<test_name>_<timestamp>.json.
+"""
+from __future__ import annotations
+
+import gc
+import json
+import math
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import torch
+from torch import Tensor
+from tqdm import tqdm
+
+_BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'
+
+from aidino.beam import GaussianBeam
+from aidino.detector import Detector
+from aidino.diffraction import BraggCoherentDiffraction
+from aidino.sample import Crystal
+
+
+# -----------------------------------------------------------------------------
+# Plot styling (tweak here for global effect)
+# -----------------------------------------------------------------------------
+
+# Color for the right (twin) y-axis used to overlay chi^2 on time/memory plots.
+TWIN_COLOR = '#7B9FBA'
+# Line styles used cyclically when multiple y_twin fields are plotted together.
+_TWIN_LINESTYLES = ('-', '--', ':', '-.')
+
+# Axes-grid padding (inches). Figure size = axes_size * grid + these, so axes
+# stay the same physical size regardless of label / tick / legend widths.
+_PAD_LEFT = 0.85          # y-label + tick labels
+_PAD_RIGHT = 0.1          # margin when no twin axis
+_PAD_RIGHT_TWIN = 0.8     # twin y-label + tick labels
+_PAD_TOP = 0.25           # top margin without title
+_PAD_TOP_TITLE = 0.8      # extra height for suptitle
+_PAD_BOTTOM = 0.65        # x-label + tick labels
+_GAP_W = 0.35             # horizontal gap between panel columns
+_LEGEND_W = 1.85          # reserved width for the legend itself (prevents clipping)
+
+
+# -----------------------------------------------------------------------------
+# Result schema + serialization
+# -----------------------------------------------------------------------------
+
+VALID_GRAD_MODES = (
+    'no_grad',
+    'fwd_continuum',
+    'fwd_sublattice',
+    'bwd_continuum',
+    'bwd_sublattice',
+)
+
+
+@dataclass
+class BenchmarkResult:
+    test_name: str
+    swept_param: str
+    swept_value: Any                        # JSON-serializable scalar/tuple
+    method: str                             # 'direct' | 'fft'
+    include_sublattice: bool
+    grad_mode: str
+    elapsed_time_s: float
+    peak_memory_gb: float
+    chi_squared_0: Optional[float] = None       # vs direct@(1,1,1) (ground truth)
+    chi_squared: Optional[float] = None          # vs direct@same supercell
+    n_supercells: Optional[int] = None
+    fft_oversampling: Optional[int] = None
+    oom: bool = False
+    extra: dict = field(default_factory=dict)
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce dataclass values to JSON-serializable forms."""
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    return value
+
+
+def save_results(
+    results: List[BenchmarkResult],
+    test_name: str,
+    output_dir: str = 'benchmark_results',
+) -> Path:
+    """Serialize a list of results to benchmark_results/<test_name>_<timestamp>.json."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_path = out_dir / f'{test_name}_{timestamp}.json'
+    payload = [_json_safe(asdict(r)) for r in results]
+    out_path.write_text(json.dumps(payload, indent=2))
+    return out_path
+
+
+def load_results(path: str | Path) -> List[BenchmarkResult]:
+    """Re-instantiate BenchmarkResult instances from a saved JSON file."""
+    data = json.loads(Path(path).read_text())
+    return [BenchmarkResult(**d) for d in data]
+
+
+# -----------------------------------------------------------------------------
+# Measurement primitive
+# -----------------------------------------------------------------------------
+
+def measure_call(
+    call_fn: Callable[[], Tensor],
+    *,
+    backward: bool = False,
+    no_grad: bool = False,
+    device: torch.device,
+    warmup: bool = True,
+    n_repeats: int = 3,
+) -> Tuple[float, float, Optional[Tensor]]:
+    """
+    Run `call_fn()`, compute intensity = |amplitude|^2, optionally .backward()
+    through loss = intensity.sum(), and report wall time and peak additional
+    GPU memory.
+
+    The CUDA peak is taken from torch.cuda.max_memory_allocated minus the
+    baseline taken right before the timed calls, so prior live tensors do not
+    inflate the result.
+
+    warmup=True (default) runs one untimed call matching the measured mode
+    (forward+backward when backward=True) before measurement. This amortizes
+    cuFFT plan caching, kernel JIT, and allocator pool growth — without it
+    the first call in a sweep can be 10x slower than subsequent calls.
+
+    n_repeats > 1 (default 3) runs the timed call N times and returns the
+    **median** elapsed time. Median is robust to occasional jitter spikes
+    (GC pauses, thermal events). Peak memory is the max across all repeats,
+    which equals the per-call peak (the workload is identical).
+
+    On CUDA OOM the function catches the error, empties the cache, and
+    returns (nan, nan, None) so the test loop can record oom=True and move on.
+    """
+    def run():
+        if no_grad:
+            with torch.no_grad():
+                amp = call_fn()
+        else:
+            amp = call_fn()
+        intensity = amp.abs() ** 2
+        if backward:
+            intensity.sum().backward()
+        return amp
+
+    try:
+        if warmup:
+            # Don't bind the result: any retained autograd graph from the
+            # warmup would inflate baseline and underreport measurement peak.
+            run()
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+            baseline = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
+
+        elapsed_per_run: List[float] = []
+        amplitude: Optional[Tensor] = None
+        for _ in range(n_repeats):
+            # Release the previous run's autograd graph before allocating the next.
+            amplitude = None
+            t_start = time.time()
+            amplitude = run()
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            elapsed_per_run.append(time.time() - t_start)
+        elapsed = float(np.median(elapsed_per_run))
+
+        if device.type == 'cuda':
+            peak = torch.cuda.max_memory_allocated(device)
+            peak_gb = (peak - baseline) / 1024 ** 3
+        else:
+            peak_gb = 0.0
+
+        return elapsed, peak_gb, amplitude
+
+    except RuntimeError as e:
+        if 'out of memory' not in str(e).lower():
+            raise
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return float('nan'), float('nan'), None
+
+
+def chi_squared(intensity: Tensor, intensity_ref: Tensor) -> float:
+    """
+    Normalized L2 error on amplitudes (Mokhtar et al. 2022, eq. 15):
+
+        chi^2 = sum_q (sqrt(I_q) - sqrt(I0_q))^2 / sum_q I0_q
+    """
+    with torch.no_grad():
+        diff = torch.sqrt(intensity) - torch.sqrt(intensity_ref)
+        return ((diff ** 2).sum() / intensity_ref.sum()).item()
+
+
+# -----------------------------------------------------------------------------
+# Scenario builder (synthetic BaTiO3 + random fields)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class BenchSetup:
+    """Canonical setup reused across all tests in one notebook session."""
+    detector: Detector
+    crystal: Crystal
+    beam: GaussianBeam
+    simulator: BraggCoherentDiffraction
+    q_vectors: Tensor
+    k_i: Tensor
+    k_f: Tensor
+    bragg_vector: Tensor
+    base_continuum: Tensor           # [1, n1, n2, n3, 3], unit-cell resolution
+    base_sublattice: Tensor          # [1, n1, n2, n3, n_atoms, 3], frac coords
+    base_mask: Tensor                # [1, n1, n2, n3], unit-cell resolution
+    crystal_size: Tuple[int, int, int]
+    supercell_size_default: Tuple[int, int, int]
+    device: torch.device
+    dtype: torch.dtype
+
+
+def build_setup(
+    *,
+    cif_path: str = 'cifs/BaTiO3.cif',
+    crystal_size: Tuple[int, int, int] = (60, 60, 60),
+    supercell_size: Tuple[int, int, int] = (2, 2, 2),
+    miller_indices: Tuple[int, int, int] = (1, 1, 0),
+    theta_B_deg: float = 31.74 / 2.0,
+    n_pixels: int = 128,
+    pixel_size: float = 75e-6,
+    distance: float = 0.1,
+    wavelength: float = 1.5406e-10,
+    fwhm_beam: float = 20e-9,
+    continuum_scale_m: float = 1e-11,   # ~0.1 angstrom per supercell, mild
+    sublattice_scale_frac: float = 0.01,  # 1% of a unit cell, mild
+    seed: int = 0,
+    device: str | torch.device = 'cuda',
+    dtype: torch.dtype = torch.float32,
+) -> BenchSetup:
+    """
+    Build a synthetic BaTiO3 scenario with random continuum + sublattice
+    displacement fields at unit-cell resolution (downsampling lets every
+    test pick its own supercell_size without rebuilding the fields).
+
+    The displacements are seeded so different runs are bit-identical.
+    """
+    device = torch.device(device)
+
+    detector = Detector(
+        num_pixels_i=n_pixels, num_pixels_j=n_pixels,
+        pixel_size=pixel_size, distance=distance, wavelength=wavelength,
+        dtype=dtype, device=device,
+    )
+
+    crystal = Crystal(
+        cif_path, crystal_size=crystal_size, wavelength=wavelength,
+        dtype=dtype, device=device,
+    )
+    crystal.align_miller_plane_to_axis(miller_indices, target_axis='x')
+
+    theta_B = torch.deg2rad(torch.tensor(theta_B_deg, dtype=dtype, device=device))
+    k_i = torch.tensor(
+        [torch.sin(-theta_B), 0.0, torch.cos(-theta_B)],
+        dtype=dtype, device=device,
+    )
+    k_f = torch.tensor(
+        [torch.sin(theta_B), 0.0, torch.cos(theta_B)],
+        dtype=dtype, device=device,
+    )
+    q_vectors = detector.calculate_q_vectors(k_i, k_f)
+    bragg_vector = detector.k_magnitude * (k_f - k_i)
+
+    # Sample the beam profile at unit-cell resolution so aidino's mask
+    # auto-downsampling adapts it to whatever supercell_size each test uses.
+    beam = GaussianBeam(wavelength=wavelength, fwhm=fwhm_beam)
+    beam.create_profile(crystal=crystal, supercell_size=(1, 1, 1), k_i=k_i)
+
+    simulator = BraggCoherentDiffraction(crystal=crystal)
+
+    n1, n2, n3 = crystal_size
+    n_atoms = crystal.n_atoms
+
+    # Build synthetic fields at unit-cell resolution so any supercell_size works.
+    # Use a Generator so seeded runs are bit-identical across sessions.
+    gen = torch.Generator(device=device).manual_seed(seed)
+    base_continuum = continuum_scale_m * torch.randn(
+        (1, n1, n2, n3, 3), generator=gen, dtype=dtype, device=device,
+    )
+    base_sublattice = sublattice_scale_frac * torch.randn(
+        (1, n1, n2, n3, n_atoms, 3), generator=gen, dtype=dtype, device=device,
+    )
+
+    base_mask = beam.profile
+
+    return BenchSetup(
+        detector=detector,
+        crystal=crystal,
+        beam=beam,
+        simulator=simulator,
+        q_vectors=q_vectors,
+        k_i=k_i,
+        k_f=k_f,
+        bragg_vector=bragg_vector,
+        base_continuum=base_continuum,
+        base_sublattice=base_sublattice,
+        base_mask=base_mask,
+        crystal_size=crystal_size,
+        supercell_size_default=supercell_size,
+        device=device,
+        dtype=dtype,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Per-call input assembler
+# -----------------------------------------------------------------------------
+
+def _parse_grad_mode(grad_mode: str) -> Tuple[Optional[str], bool]:
+    """Map a grad_mode string to (grad_target, do_backward).
+
+    grad_target: 'continuum' | 'sublattice' | None (no_grad)
+    do_backward: True if a .backward() call is needed.
+    """
+    if grad_mode == 'no_grad':       return None,         False
+    if grad_mode == 'fwd_continuum': return 'continuum',  False
+    if grad_mode == 'fwd_sublattice':return 'sublattice', False
+    if grad_mode == 'bwd_continuum': return 'continuum',  True
+    if grad_mode == 'bwd_sublattice':return 'sublattice', True
+    raise ValueError(
+        f"Unknown grad_mode {grad_mode!r}; expected one of {VALID_GRAD_MODES}"
+    )
+
+
+def make_data_inputs(
+    setup: BenchSetup,
+    *,
+    include_sublattice: bool,
+    grad_mode: str,
+) -> dict:
+    """
+    Build the data-input kwargs for calculate_supercell_scattering.
+
+    Clones the base tensors so requires_grad can be flipped per-call without
+    leaking grad state into the next config. Raises if a sublattice grad mode
+    is requested with include_sublattice=False.
+    """
+    grad_target, _ = _parse_grad_mode(grad_mode)
+    if grad_target == 'sublattice' and not include_sublattice:
+        raise ValueError(
+            f"grad_mode={grad_mode!r} requires include_sublattice=True"
+        )
+
+    inputs: dict = {'mask': setup.base_mask}
+
+    continuum = setup.base_continuum.clone()
+    if grad_target == 'continuum':
+        continuum.requires_grad_(True)
+    inputs['continuum_displacement'] = continuum
+
+    if include_sublattice:
+        sublattice = setup.base_sublattice.clone()
+        if grad_target == 'sublattice':
+            sublattice.requires_grad_(True)
+        inputs['sublattice_displacement'] = sublattice
+
+    return inputs
+
+
+def _grad_modes_for(include_sublattice: bool) -> Tuple[str, ...]:
+    """Default grad-mode tuple: pair the gradient target with the relevant input."""
+    if include_sublattice:
+        return ('no_grad', 'fwd_sublattice', 'bwd_sublattice')
+    return ('no_grad', 'fwd_continuum', 'bwd_continuum')
+
+
+def _cleanup(device: torch.device) -> None:
+    """Best-effort release of intermediates between configs."""
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+
+def _n_supercells(crystal_size: Tuple[int, int, int],
+                  supercell_size: Tuple[int, int, int]) -> int:
+    return int(
+        (crystal_size[0] // supercell_size[0])
+        * (crystal_size[1] // supercell_size[1])
+        * (crystal_size[2] // supercell_size[2])
+    )
+
+
+def make_supercell_grid(
+    crystal_size: Tuple[int, int, int],
+    *,
+    include_full: bool = False,
+    max_k: Optional[int] = None,
+) -> List[Tuple[int, int, int]]:
+    """
+    Generate (k, k, k) supercell sizes where k evenly divides every axis
+    of crystal_size. Mirrors the workflow.ipynb convention.
+
+    include_full=False (default) drops the entry that would put the entire
+    crystal in a single supercell. max_k optionally caps k to keep sweeps
+    short on large crystals.
+    """
+    g = math.gcd(math.gcd(int(crystal_size[0]), int(crystal_size[1])),
+                 int(crystal_size[2]))
+    factors = sorted({i for i in range(1, int(math.isqrt(g)) + 1)
+                      if g % i == 0} | {g // i for i in range(1, int(math.isqrt(g)) + 1)
+                                        if g % i == 0})
+    if not include_full:
+        factors = [k for k in factors if k != g]
+    if max_k is not None:
+        factors = [k for k in factors if k <= max_k]
+    return [(k, k, k) for k in factors]
+
+
+def recommend_fft_oversampling(setup: BenchSetup) -> int:
+    """M = max(2 * ceil(beta), 8) using the BCDI oversampling ratio."""
+    beta = setup.detector.calculate_oversampling_ratio(
+        setup.crystal.crystal_volume
+    ).item()
+    return int(max(2 * math.ceil(beta), 8))
+
+
+def recommend_supercell_size(setup: BenchSetup) -> Tuple[int, int, int]:
+    """
+    Largest supercell_size = (d1, d2, d3) such that d_i * |a_i| < ΔX along
+    every crystal axis, where ΔX is the detector real-space resolution.
+    Coarser supercells violate the supercell approximation.
+    """
+    delta_x = setup.detector.calculate_resolution()
+    a_norms = setup.crystal.lattice_vectors.norm(dim=-1).detach().cpu().numpy()
+    d = tuple(max(1, int(delta_x / float(a))) for a in a_norms)
+    return d
+
+
+# -----------------------------------------------------------------------------
+# Tests
+# -----------------------------------------------------------------------------
+
+def test_method_vs_supercells(
+    setup: BenchSetup,
+    supercell_size_grid: Sequence[Tuple[int, int, int]],
+    *,
+    methods: Sequence[str] = ('direct', 'fft'),
+    include_sublattice_options: Sequence[bool] = (False, True),
+    grad_modes: Optional[Sequence[str]] = None,
+    q_batch_size: int = 64,
+    fft_oversampling: Optional[int] = None,
+    n_repeats: int = 3,
+    verbose: bool = False,
+) -> List[BenchmarkResult]:
+    """
+    Sweep `supercell_size_grid` for both methods. Records time and peak
+    additional GPU memory per (include_sublattice, grad_mode, method);
+    no error metric. swept_value is supercell_size_product = d1*d2*d3.
+    """
+    results: List[BenchmarkResult] = []
+    M = fft_oversampling or recommend_fft_oversampling(setup)
+
+    total = sum(
+        len(supercell_size_grid) * len(methods) *
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        for s in include_sublattice_options
+    )
+    pbar = tqdm(total=total, disable=verbose,
+                desc='method_vs_supercells', bar_format=_BAR_FORMAT)
+
+    for include_sub in include_sublattice_options:
+        modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
+        for sc_size in supercell_size_grid:
+            n_sc = _n_supercells(setup.crystal_size, sc_size)
+            for method in methods:
+                for grad_mode in modes:
+                    pbar.update(1)
+                    # Release the previous iteration's amplitude (+ any retained
+                    # autograd graph) so it doesn't sit in GPU memory through
+                    # the next config's measurement.
+                    _amp = None
+                    _, do_bwd = _parse_grad_mode(grad_mode)
+                    _cleanup(setup.device)
+                    try:
+                        data = make_data_inputs(
+                            setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                        )
+                    except ValueError:
+                        continue  # sublattice mode without sublattice — skip
+
+                    call_kwargs = {**data}
+                    if method == 'direct':
+                        call_kwargs['q_batch_size'] = q_batch_size
+                    elif method == 'fft':
+                        call_kwargs['method'] = 'fft'
+                        call_kwargs['bragg_vector'] = setup.bragg_vector
+                        call_kwargs['fft_oversampling'] = M
+
+                    def call_fn():
+                        return setup.simulator.calculate_supercell_scattering(
+                            setup.q_vectors, sc_size, **call_kwargs
+                        )
+
+                    elapsed, peak, _amp = measure_call(
+                        call_fn,
+                        backward=do_bwd,
+                        no_grad=(grad_mode == 'no_grad'),
+                        device=setup.device,
+                        n_repeats=n_repeats,
+                    )
+                    oom = math.isnan(elapsed)
+                    results.append(BenchmarkResult(
+                        test_name='method_vs_supercells',
+                        swept_param='supercell_size_product',
+                        swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
+                        method=method,
+                        include_sublattice=include_sub,
+                        grad_mode=grad_mode,
+                        elapsed_time_s=elapsed if not oom else float('nan'),
+                        peak_memory_gb=peak if not oom else float('nan'),
+                        n_supercells=n_sc,
+                        fft_oversampling=M if method == 'fft' else None,
+                        oom=oom,
+                        extra={'supercell_size': list(sc_size),
+                               'q_batch_size': q_batch_size if method == 'direct' else None},
+                    ))
+                    if verbose:
+                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                        print(f"  [n_sc={n_sc}, {method}, sub={include_sub}, {grad_mode}] {tag}")
+
+    pbar.close()
+    return results
+
+
+def test_direct_vs_qbatch(
+    setup: BenchSetup,
+    q_batch_sizes: Sequence[int],
+    *,
+    include_sublattice_options: Sequence[bool] = (False, True),
+    grad_modes: Optional[Sequence[str]] = None,
+    supercell_size: Optional[Tuple[int, int, int]] = None,
+    n_repeats: int = 3,
+    verbose: bool = False,
+) -> List[BenchmarkResult]:
+    """Sweep `q_batch_size` for the direct method. Records time + memory."""
+    sc_size = supercell_size or setup.supercell_size_default
+    n_sc = _n_supercells(setup.crystal_size, sc_size)
+    results: List[BenchmarkResult] = []
+
+    total = sum(
+        len(q_batch_sizes) *
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        for s in include_sublattice_options
+    )
+    pbar = tqdm(total=total, disable=verbose,
+                desc='direct_vs_qbatch', bar_format=_BAR_FORMAT)
+
+    for include_sub in include_sublattice_options:
+        modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
+        for qbs in q_batch_sizes:
+            for grad_mode in modes:
+                pbar.update(1)
+                # Release the previous iteration's amplitude (+ any retained
+                # autograd graph) so it doesn't sit in GPU memory through
+                # the next config's measurement.
+                _amp = None
+                _, do_bwd = _parse_grad_mode(grad_mode)
+                _cleanup(setup.device)
+                try:
+                    data = make_data_inputs(
+                        setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                    )
+                except ValueError:
+                    continue
+
+                def call_fn():
+                    return setup.simulator.calculate_supercell_scattering(
+                        setup.q_vectors, sc_size, q_batch_size=qbs, **data
+                    )
+
+                elapsed, peak, _amp = measure_call(
+                    call_fn,
+                    backward=do_bwd,
+                    no_grad=(grad_mode == 'no_grad'),
+                    device=setup.device,
+                    n_repeats=n_repeats,
+                )
+                oom = math.isnan(elapsed)
+                results.append(BenchmarkResult(
+                    test_name='direct_vs_qbatch',
+                    swept_param='q_batch_size',
+                    swept_value=qbs,
+                    method='direct',
+                    include_sublattice=include_sub,
+                    grad_mode=grad_mode,
+                    elapsed_time_s=elapsed if not oom else float('nan'),
+                    peak_memory_gb=peak if not oom else float('nan'),
+                    n_supercells=n_sc,
+                    oom=oom,
+                    extra={'supercell_size': list(sc_size)},
+                ))
+                if verbose:
+                    tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                    print(f"  [qbs={qbs}, sub={include_sub}, {grad_mode}] {tag}")
+
+    pbar.close()
+    return results
+
+
+def _intensity_from_call(setup: BenchSetup, sc_size, call_kwargs) -> Tensor:
+    """Helper: run one direct/FFT call (no_grad) and return intensity tensor."""
+    with torch.no_grad():
+        amp = setup.simulator.calculate_supercell_scattering(
+            setup.q_vectors, sc_size, **call_kwargs,
+        )
+    return amp.abs() ** 2
+
+
+def test_direct_error_vs_supercell(
+    setup: BenchSetup,
+    supercell_sizes: Sequence[Tuple[int, int, int]],
+    *,
+    include_sublattice_options: Sequence[bool] = (False, True),
+    grad_modes: Optional[Sequence[str]] = None,
+    q_batch_size: int = 64,
+    n_repeats: int = 3,
+    verbose: bool = False,
+) -> List[BenchmarkResult]:
+    """
+    Direct method only. For each include_sublattice, compute a reference
+    intensity at supercell_size=(1,1,1) under no_grad, then sweep
+    `supercell_sizes` recording time and memory per grad_mode plus chi^2
+    vs the reference (computed once per swept value under no_grad — chi^2
+    is independent of grad_mode).
+
+    The reference itself is the first entry — chi^2 should be ~0.
+    """
+    if tuple(supercell_sizes[0]) != (1, 1, 1):
+        raise ValueError("supercell_sizes[0] must be (1, 1, 1) — used as the reference.")
+
+    results: List[BenchmarkResult] = []
+
+    total = sum(
+        len(supercell_sizes) *
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        for s in include_sublattice_options
+    )
+    pbar = tqdm(total=total, disable=verbose,
+                desc='direct_error_vs_supercell', bar_format=_BAR_FORMAT)
+
+    for include_sub in include_sublattice_options:
+        modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
+
+        # Reference intensity (no_grad, identical inputs) per include_sublattice setting.
+        _cleanup(setup.device)
+        try:
+            data_ref = make_data_inputs(
+                setup, include_sublattice=include_sub, grad_mode='no_grad',
+            )
+        except ValueError:
+            continue
+        ref_kwargs = {**data_ref, 'q_batch_size': q_batch_size}
+        try:
+            intensity_ref = _intensity_from_call(setup, (1, 1, 1), ref_kwargs)
+        except RuntimeError as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            torch.cuda.empty_cache()
+            tqdm.write(f"  reference OOM for include_sublattice={include_sub}; skipping")
+            continue
+
+        for sc_size in supercell_sizes:
+            n_sc = _n_supercells(setup.crystal_size, sc_size)
+            for grad_mode in modes:
+                pbar.update(1)
+                # Release the previous iteration's amplitude (+ any retained
+                # autograd graph) so it doesn't sit in GPU memory through
+                # the next config's measurement.
+                amp = None
+                _, do_bwd = _parse_grad_mode(grad_mode)
+                _cleanup(setup.device)
+                try:
+                    data = make_data_inputs(
+                        setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                    )
+                except ValueError:
+                    continue
+
+                def call_fn():
+                    return setup.simulator.calculate_supercell_scattering(
+                        setup.q_vectors, sc_size, q_batch_size=q_batch_size, **data,
+                    )
+
+                elapsed, peak, amp = measure_call(
+                    call_fn,
+                    backward=do_bwd,
+                    no_grad=(grad_mode == 'no_grad'),
+                    device=setup.device,
+                    n_repeats=n_repeats,
+                )
+                oom = math.isnan(elapsed)
+                chi2_0: Optional[float] = None
+                # chi^2 is independent of grad_mode (depends only on the forward
+                # amplitude), so compute it once per swept value under no_grad.
+                # Skip the (1, 1, 1) reference itself since chi^2 vs itself is 0.
+                if (not oom and amp is not None and grad_mode == 'no_grad'
+                        and tuple(sc_size) != (1, 1, 1)):
+                    intensity = amp.abs() ** 2
+                    chi2_0 = chi_squared(intensity.detach(), intensity_ref)
+
+                results.append(BenchmarkResult(
+                    test_name='direct_error_vs_supercell',
+                    swept_param='supercell_size_product',
+                    swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
+                    method='direct',
+                    include_sublattice=include_sub,
+                    grad_mode=grad_mode,
+                    elapsed_time_s=elapsed if not oom else float('nan'),
+                    peak_memory_gb=peak if not oom else float('nan'),
+                    chi_squared_0=chi2_0,
+                    n_supercells=n_sc,
+                    oom=oom,
+                    extra={'supercell_size': list(sc_size),
+                           'q_batch_size': q_batch_size},
+                ))
+                if verbose:
+                    tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB, chi2_0={chi2_0:.2e}'
+                    print(f"  [sc={sc_size}, sub={include_sub}, {grad_mode}] {tag}")
+
+        # Drop the reference before moving to next include_sub.
+        del intensity_ref
+        _cleanup(setup.device)
+
+    pbar.close()
+    return results
+
+
+def test_fft_error_vs_oversampling(
+    setup: BenchSetup,
+    oversampling_factors: Sequence[int],
+    *,
+    include_sublattice_options: Sequence[bool] = (False, True),
+    grad_modes: Optional[Sequence[str]] = None,
+    supercell_size: Optional[Tuple[int, int, int]] = None,
+    q_batch_size: int = 64,
+    n_repeats: int = 3,
+    verbose: bool = False,
+) -> List[BenchmarkResult]:
+    """
+    FFT method only. For each include_sublattice, compute a direct-method
+    reference intensity once (no_grad), then sweep `oversampling_factors`
+    recording time and memory per grad_mode plus chi^2 vs the direct
+    reference (computed once per M under no_grad — chi^2 is independent
+    of grad_mode).
+    """
+    sc_size = supercell_size or setup.supercell_size_default
+    n_sc = _n_supercells(setup.crystal_size, sc_size)
+    results: List[BenchmarkResult] = []
+
+    total = sum(
+        len(oversampling_factors) *
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        for s in include_sublattice_options
+    )
+    pbar = tqdm(total=total, disable=verbose,
+                desc='fft_error_vs_oversampling', bar_format=_BAR_FORMAT)
+
+    for include_sub in include_sublattice_options:
+        modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
+
+        _cleanup(setup.device)
+        try:
+            data_ref = make_data_inputs(
+                setup, include_sublattice=include_sub, grad_mode='no_grad',
+            )
+        except ValueError:
+            continue
+        ref_kwargs = {**data_ref, 'q_batch_size': q_batch_size}
+        try:
+            intensity_ref = _intensity_from_call(setup, sc_size, ref_kwargs)
+        except RuntimeError as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            torch.cuda.empty_cache()
+            tqdm.write(f"  direct@sc reference OOM for include_sublattice={include_sub}; skipping")
+            continue
+        # Ground-truth reference: direct@(1,1,1). chi^2 vs this is the total
+        # error (supercell + FFT combined), independent of the supercell
+        # approximation. Skipped on OOM with chi_squared_0 left as None.
+        intensity_ref_0: Optional[Tensor] = None
+        try:
+            intensity_ref_0 = _intensity_from_call(setup, (1, 1, 1), ref_kwargs)
+        except RuntimeError as e:
+            if 'out of memory' not in str(e).lower():
+                raise
+            torch.cuda.empty_cache()
+            tqdm.write(f"  direct@(1,1,1) reference OOM for include_sublattice={include_sub}; chi^2_0 will be None")
+
+        for M in oversampling_factors:
+            for grad_mode in modes:
+                pbar.update(1)
+                # Release the previous iteration's amplitude (+ any retained
+                # autograd graph) so it doesn't sit in GPU memory through
+                # the next config's measurement.
+                amp = None
+                _, do_bwd = _parse_grad_mode(grad_mode)
+                _cleanup(setup.device)
+                try:
+                    data = make_data_inputs(
+                        setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                    )
+                except ValueError:
+                    continue
+
+                call_kwargs = {
+                    **data,
+                    'method': 'fft',
+                    'bragg_vector': setup.bragg_vector,
+                    'fft_oversampling': M,
+                }
+
+                def call_fn():
+                    return setup.simulator.calculate_supercell_scattering(
+                        setup.q_vectors, sc_size, **call_kwargs,
+                    )
+
+                elapsed, peak, amp = measure_call(
+                    call_fn,
+                    backward=do_bwd,
+                    no_grad=(grad_mode == 'no_grad'),
+                    device=setup.device,
+                    n_repeats=n_repeats,
+                )
+                oom = math.isnan(elapsed)
+                chi2: Optional[float] = None
+                chi2_0: Optional[float] = None
+                # chi^2 is independent of grad_mode (depends only on the forward
+                # amplitude), so compute it once per swept value under no_grad.
+                if not oom and amp is not None and grad_mode == 'no_grad':
+                    intensity = amp.abs() ** 2
+                    chi2 = chi_squared(intensity.detach(), intensity_ref)
+                    if intensity_ref_0 is not None:
+                        chi2_0 = chi_squared(intensity.detach(), intensity_ref_0)
+
+                results.append(BenchmarkResult(
+                    test_name='fft_error_vs_oversampling',
+                    swept_param='fft_oversampling',
+                    swept_value=int(M),
+                    method='fft',
+                    include_sublattice=include_sub,
+                    grad_mode=grad_mode,
+                    elapsed_time_s=elapsed if not oom else float('nan'),
+                    peak_memory_gb=peak if not oom else float('nan'),
+                    chi_squared=chi2,
+                    chi_squared_0=chi2_0,
+                    n_supercells=n_sc,
+                    fft_oversampling=int(M),
+                    oom=oom,
+                    extra={'supercell_size': list(sc_size),
+                           'q_batch_size': q_batch_size},
+                ))
+                if verbose:
+                    if oom:
+                        tag = 'OOM'
+                    else:
+                        chi2_str = f'{chi2:.2e}' if chi2 is not None else '-'
+                        chi2_0_str = f'{chi2_0:.2e}' if chi2_0 is not None else '-'
+                        tag = f't={elapsed:.3f}s, mem={peak:.3f}GB, chi2={chi2_str}, chi2_0={chi2_0_str}'
+                    print(f"  [M={M}, sub={include_sub}, {grad_mode}] {tag}")
+
+        del intensity_ref
+        if intensity_ref_0 is not None:
+            del intensity_ref_0
+        _cleanup(setup.device)
+
+    pbar.close()
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Plotting helpers
+# -----------------------------------------------------------------------------
+
+def _filter(results: Iterable[BenchmarkResult], **predicates) -> List[BenchmarkResult]:
+    out = []
+    for r in results:
+        if all(getattr(r, k) == v for k, v in predicates.items()):
+            out.append(r)
+    return out
+
+
+_Y_LABELS = {
+    'elapsed_time_s': 'Compute time (s)',
+    'peak_memory_gb': 'Peak memory (GB)',
+    'chi_squared_0': r'$\chi^2_0$',
+    'chi_squared': r'$\chi^2$',
+}
+
+_X_LABELS = {
+    'n_supercells': 'Number of supercells',
+    'q_batch_size': r'$q$-batch size',
+    'supercell_size_product': 'Unit cells per supercell',
+    'fft_oversampling': r'FFT oversampling factor',
+}
+
+# Grad-mode category for plotting. The continuum/sublattice distinction is
+# implied by the panel (see _grad_modes_for); the legend just shows the
+# direction of the gradient.
+_GRAD_CATEGORIES = ('No grad', 'Forward', 'Backward')
+_GRAD_CATEGORY = {
+    'no_grad': 'No grad',
+    'fwd_continuum': 'Forward',
+    'fwd_sublattice': 'Forward',
+    'bwd_continuum': 'Backward',
+    'bwd_sublattice': 'Backward',
+}
+
+_METHOD_LABELS = {'direct': 'Direct', 'fft': 'FFT'}
+
+_FACET_TITLES = {
+    'include_sublattice': {True: 'With sublattice', False: 'No sublattice'},
+    'method': _METHOD_LABELS,
+}
+
+_MARKERS_BY_METHOD = {'direct': 'o', 'fft': 's'}
+
+
+def _legend_props():
+    """plot_utils.props with a smaller size for legend text."""
+    from aidino.plot_utils import props
+    p = props.copy()
+    p.set_size('medium')
+    return p
+
+
+def _default_cmap():
+    """Truncated cmcrameri batlow if available, else a viridis subset."""
+    import matplotlib.pyplot as plt
+    from aidino.plot_utils import truncate_colormap
+    try:
+        import cmcrameri.cm as cm
+        return truncate_colormap(cm.batlow, 0.2, 0.7)
+    except ImportError:
+        return truncate_colormap(plt.cm.viridis, 0.2, 0.7)
+
+
+def plot_sweep(
+    results: List[BenchmarkResult],
+    y: str = 'elapsed_time_s',
+    *,
+    y_twin: Optional[Union[str, Sequence[str]]] = None,
+    group_by: str = 'method',
+    facet_by: Optional[str] = 'include_sublattice',
+    log_x: bool = True,
+    log_y: bool = True,
+    log_y_twin: bool = True,
+    title: Optional[str] = None,
+    axes_size: Tuple[float, float] = (2.5, 2.5),
+    vlines: Optional[Sequence[Tuple]] = None,
+):
+    """
+    Scatter `y` vs swept_value, optionally faceted by `facet_by` into
+    side-by-side panels with a shared y-axis (y-label on the leftmost
+    panel only).
+
+    The figure uses manual axes positioning so each panel is exactly
+    `axes_size` inches regardless of label / tick / legend widths, giving
+    consistent panel sizes across calls. Tune `axes_size` (and the
+    `_PAD_*` constants at the top of this module) to taste.
+
+    A single shared legend lives to the right of the rightmost panel:
+        - marker shape: method (Direct: circle, FFT: square)
+        - line color:   grad-mode category (No grad, Forward, Backward)
+    The displacement target the gradient is taken w.r.t. (continuum or
+    sublattice) is implied by the panel — see `_grad_modes_for` for the
+    pairing per `include_sublattice` setting.
+
+    Uses aidino.plot_utils.format_axis for typography and the cmcrameri
+    `batlow` colormap (falls back to viridis if cmcrameri is unavailable).
+    OOM points are skipped silently.
+
+    y_twin: optional field (or list of fields) plotted on a shared right-side
+    twin axis (colored TWIN_COLOR). Used for overlaying chi^2 on a
+    time/memory plot. Only no_grad rows are plotted since chi^2 is
+    independent of grad_mode. When given as a list, each field is drawn
+    in the same color with a distinct linestyle (solid, dashed, dotted,
+    dash-dot in order). Right spine and tick marks are colored on every
+    panel; tick labels and y-label appear on the rightmost panel only
+    (axes are shared).
+
+    vlines: optional reference lines drawn as dashed grey verticals on every
+    panel. Each entry is either (x_value, legend_label) or
+    (x_value, legend_label, valid_side) — valid_side is 'left' or 'right'
+    to mark which side of the line is the valid regime; the opposite side
+    is faintly shaded as the invalid region (omit for no shading).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from aidino.plot_utils import format_axis, props
+
+    cmap = _default_cmap()
+    legend_props = _legend_props()
+
+    # Normalize y_twin to a list (possibly empty) for uniform handling.
+    if y_twin is None:
+        y_twin_list: List[str] = []
+    elif isinstance(y_twin, str):
+        y_twin_list = [y_twin]
+    else:
+        y_twin_list = list(y_twin)
+
+    n_cat = len(_GRAD_CATEGORIES)
+    cat_color = {
+        cat: cmap(i / max(n_cat - 1, 1))
+        for i, cat in enumerate(_GRAD_CATEGORIES)
+    }
+
+    facet_values = (
+        sorted({getattr(r, facet_by) for r in results}) if facet_by else [None]
+    )
+    n_facets = len(facet_values)
+
+    # ---- Compute figure size and axes positions (inches) ----
+    aw, ah = axes_size
+    pad_right = _PAD_RIGHT_TWIN if y_twin_list else _PAD_RIGHT
+    pad_top = _PAD_TOP_TITLE if title else _PAD_TOP
+    fig_w = (_PAD_LEFT + aw * n_facets + _GAP_W * (n_facets - 1)
+             + pad_right + _LEGEND_W)
+    fig_h = pad_top + ah + _PAD_BOTTOM
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    axes: List = []
+    for col in range(n_facets):
+        left_in = _PAD_LEFT + col * (aw + _GAP_W)
+        ax = fig.add_axes([
+            left_in / fig_w,
+            _PAD_BOTTOM / fig_h,
+            aw / fig_w,
+            ah / fig_h,
+        ])
+        axes.append(ax)
+    # Share y across panels (sharex is irrelevant for a single row).
+    for ax in axes[1:]:
+        ax.sharey(axes[0])
+
+    twin_axes: List = []
+    if y_twin_list:
+        for i, ax in enumerate(axes):
+            ax_t = ax.twinx()
+            if i > 0:
+                ax_t.sharey(twin_axes[0])
+            twin_axes.append(ax_t)
+
+    methods_seen: set = set()
+    cats_seen: set = set()
+    twins_plotted: set = set()
+
+    for panel_idx, (ax, facet_val) in enumerate(zip(axes, facet_values)):
+        subset = _filter(results, **({facet_by: facet_val} if facet_by else {}))
+        if not subset:
+            continue
+        group_vals = sorted({getattr(r, group_by) for r in subset})
+        grad_modes_present = sorted(
+            {r.grad_mode for r in subset}, key=VALID_GRAD_MODES.index,
+        )
+
+        for gv in group_vals:
+            for gm in grad_modes_present:
+                pts = [
+                    r for r in subset
+                    if getattr(r, group_by) == gv and r.grad_mode == gm
+                    and not r.oom and getattr(r, y) is not None
+                ]
+                if not pts:
+                    continue
+                pts.sort(key=lambda r: r.swept_value)
+                xs = [r.swept_value for r in pts]
+                ys = [getattr(r, y) for r in pts]
+                category = _GRAD_CATEGORY.get(gm, gm)
+                color = cat_color.get(category, 'black')
+                marker = _MARKERS_BY_METHOD.get(gv, 'o') if group_by == 'method' else 'o'
+                if group_by == 'method':
+                    methods_seen.add(gv)
+                cats_seen.add(category)
+                ax.plot(
+                    xs, ys,
+                    marker=marker, color=color,
+                    linestyle='-', linewidth=1, markersize=5,
+                )
+
+        if y_twin_list:
+            ax_t = twin_axes[panel_idx]
+            no_grad_subset = [r for r in subset
+                              if r.grad_mode == 'no_grad' and not r.oom]
+            for y_t_idx, y_t in enumerate(y_twin_list):
+                linestyle = _TWIN_LINESTYLES[y_t_idx % len(_TWIN_LINESTYLES)]
+                twin_data = [r for r in no_grad_subset
+                             if getattr(r, y_t) is not None]
+                twin_methods = (
+                    sorted({getattr(r, group_by) for r in twin_data})
+                    if group_by == 'method' else [None]
+                )
+                for gv in twin_methods:
+                    pts = [
+                        r for r in twin_data
+                        if gv is None or getattr(r, group_by) == gv
+                    ]
+                    if not pts:
+                        continue
+                    pts.sort(key=lambda r: r.swept_value)
+                    xs = [r.swept_value for r in pts]
+                    ys = [getattr(r, y_t) for r in pts]
+                    marker = _MARKERS_BY_METHOD.get(gv, 'o') if gv is not None else 'o'
+                    ax_t.plot(
+                        xs, ys,
+                        marker=marker, color=TWIN_COLOR,
+                        linestyle=linestyle, linewidth=1, markersize=5,
+                    )
+                    twins_plotted.add(y_t)
+
+        if log_x:
+            ax.set_xscale('log')
+        if log_y:
+            ax.set_yscale('log')
+
+        if vlines:
+            # Use the data-driven xlim as the shading edge so the patch
+            # doesn't extend the view. Lock the xlim afterwards so a later
+            # autoscale can't re-include the patch bounds.
+            xlim = ax.get_xlim()
+            for vline in vlines:
+                x_val = vline[0]
+                valid_side = vline[2] if len(vline) > 2 else None
+                if valid_side == 'left':
+                    ax.axvspan(x_val, xlim[1], color='gray', alpha=0.08, zorder=0)
+                elif valid_side == 'right':
+                    ax.axvspan(xlim[0], x_val, color='gray', alpha=0.08, zorder=0)
+                ax.axvline(x_val, color='gray', linestyle='--',
+                           linewidth=1, alpha=0.7)
+            ax.set_xlim(xlim)
+
+        swept_param = subset[0].swept_param
+        is_left = (panel_idx == 0)
+        if facet_by and facet_val is not None:
+            panel_title = _FACET_TITLES.get(facet_by, {}).get(
+                facet_val, f'{facet_by}={facet_val}'
+            )
+        else:
+            panel_title = ''
+        format_axis(
+            ax,
+            xlabel=_X_LABELS.get(swept_param, swept_param),
+            ylabel=_Y_LABELS.get(y, y) if is_left else '',
+            title=panel_title,
+        )
+        if not is_left:
+            plt.setp(ax.get_yticklabels(), visible=False)
+
+    # Format twin axes: color spine + major/minor ticks on EVERY panel;
+    # show tick labels and y-label only on the rightmost (axes are shared).
+    if y_twin_list and twin_axes:
+        # When multiple y_twin fields are shown, leave the y-label generic
+        # ('$\chi^2$ error') since the legend already disambiguates each
+        # field via linestyle.
+        if len(y_twin_list) == 1:
+            twin_ylabel = _Y_LABELS.get(y_twin_list[0], y_twin_list[0])
+        else:
+            twin_ylabel = r'$\chi^2$ error'
+        for i, ax_t in enumerate(twin_axes):
+            is_rightmost = (i == n_facets - 1)
+            if log_y_twin:
+                ax_t.set_yscale('log')
+            ax_t.spines['right'].set_color(TWIN_COLOR)
+            ax_t.tick_params(axis='y', which='both', colors=TWIN_COLOR)
+            if is_rightmost:
+                ax_t.set_ylabel(
+                    twin_ylabel, color=TWIN_COLOR, fontproperties=props,
+                )
+                for lbl in ax_t.get_yticklabels(which='both'):
+                    lbl.set_fontproperties(props)
+                ax_t.yaxis.offsetText.set_fontproperties(props)
+                ax_t.yaxis.offsetText.set_color(TWIN_COLOR)
+            else:
+                plt.setp(ax_t.get_yticklabels(), visible=False)
+
+    # Build the shared legend: grad categories (colored lines), then methods
+    # (shaped markers in neutral black), then twin entry, then vlines.
+    proxies: list = []
+    labels: list = []
+    for cat in _GRAD_CATEGORIES:
+        if cat in cats_seen:
+            proxies.append(Line2D([0], [0], color=cat_color[cat], linewidth=1.5))
+            labels.append(cat)
+    if group_by == 'method' and len(methods_seen) > 1:
+        # Only show method markers in the legend when more than one method
+        # is plotted — otherwise the marker shape carries no information.
+        for method in ('direct', 'fft'):
+            if method in methods_seen:
+                proxies.append(Line2D(
+                    [0], [0], color='black', linestyle='',
+                    marker=_MARKERS_BY_METHOD[method], markersize=5,
+                ))
+                labels.append(_METHOD_LABELS[method])
+    for y_t_idx, y_t in enumerate(y_twin_list):
+        if y_t in twins_plotted:
+            linestyle = _TWIN_LINESTYLES[y_t_idx % len(_TWIN_LINESTYLES)]
+            proxies.append(Line2D(
+                [0], [0], color=TWIN_COLOR, linewidth=1.5,
+                linestyle=linestyle,
+            ))
+            labels.append(_Y_LABELS.get(y_t, y_t))
+    if vlines:
+        for vline in vlines:
+            vlabel = vline[1]
+            proxies.append(Line2D(
+                [0], [0], color='gray', linestyle='--',
+                linewidth=1, alpha=0.7,
+            ))
+            labels.append(vlabel)
+    if proxies:
+        legend_left_in = fig_w - _LEGEND_W
+        fig.legend(
+            proxies, labels,
+            loc='center left',
+            bbox_to_anchor=(legend_left_in / fig_w, 0.5),
+            bbox_transform=fig.transFigure,
+            frameon=False, prop=legend_props,
+        )
+
+    if title:
+        # Center over the axes grid (excluding right padding + legend column).
+        axes_left_in = _PAD_LEFT
+        axes_right_in = (_PAD_LEFT + aw * n_facets + _GAP_W * (n_facets - 1))
+        suptitle_x = 0.5 * (axes_left_in + axes_right_in) / fig_w
+        suptitle_y = 1 - (_PAD_TOP_TITLE / 2) / fig_h
+        fig.suptitle(title, x=suptitle_x, y=suptitle_y, fontproperties=props)
+    return fig

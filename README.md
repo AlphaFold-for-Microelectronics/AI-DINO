@@ -29,13 +29,60 @@ AI-DINO extends the Mokhtar et al. framework in several ways:
 | `xpcs.py` | Two-time intensity correlation for XPCS analysis |
 | `xray_utils.py` | Utility functions (wavelength/energy conversion, etc.) |
 
-## Requirements
+## Installation
 
-See `requirements.txt`. Key dependencies:
+### 1. Create an isolated environment (conda or venv)
+
+With conda (recommended for CUDA users — pulls in the right CUDA runtime):
+
+```bash
+conda create -n aidino python=3.11
+conda activate aidino
+```
+
+Or with venv:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Install PyTorch first (CUDA users only)
+
+For GPU support, install PyTorch *before* aidino using the official
+command from https://pytorch.org/get-started/locally/ — the correct wheel
+depends on your CUDA toolkit version. Example for CUDA 12.1:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+Skip this step for a CPU-only install — `pip install -e .` will pull
+torch from PyPI in step 3.
+
+### 3. Install aidino in editable mode
+
+```bash
+git clone <repo>
+cd AI-DINO
+pip install -e .
+```
+
+For notebook usage, install the extras:
+
+```bash
+pip install -e ".[notebook]"
+```
+
+Then open notebooks from the `notebooks/` directory.
+
+## Key dependencies
 
 - `torch` — all scattering calculations are fully differentiable PyTorch operations
 - `pymatgen` — CIF parsing and crystal structure handling
 - `netCDF4` — Exodus II file I/O
+
+Full dependency list is in `pyproject.toml`.
 
 ## Reference
 

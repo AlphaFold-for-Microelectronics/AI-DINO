@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aidino"
+version = "0.1.0"
+description = "Differentiable BCDI simulation toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Nina Andrejevic"}]
+dependencies = [
+    "torch",
+    "numpy",
+    "matplotlib",
+    "pymatgen",
+    "py3Dmol",
+    "xraydb",
+    "cmcrameri",
+    "torchdiffeq",
+    "tqdm",
+    "netcdf4",
+    "ase",
+    "einops",
+    "scipy",
+    "scikit-learn",
+    "networkx",
+    "pandas",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+notebook = ["notebook", "jupyter"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aidino*"]
+
+[tool.setuptools.package-data]
+aidino = ["resources/*.json"]
