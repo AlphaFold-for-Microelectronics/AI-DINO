@@ -119,9 +119,15 @@ def _json_safe(value: Any) -> Any:
 def save_results(
     results: List[BenchmarkResult],
     test_name: str,
-    output_dir: str = 'benchmark_results',
+    output_dir: str = '../benchmark_results',
 ) -> Path:
-    """Serialize a list of results to benchmark_results/<test_name>_<timestamp>.json."""
+    """Serialize results to <output_dir>/<test_name>_<timestamp>.json.
+
+    The default `'../benchmark_results'` assumes the caller is in the
+    project's `notebooks/` directory and writes to the project-root
+    `benchmark_results/` (the conventional location). Override
+    `output_dir` for scripts run from elsewhere.
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
