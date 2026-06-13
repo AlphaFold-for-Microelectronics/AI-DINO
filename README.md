@@ -60,7 +60,7 @@ command from https://pytorch.org/get-started/locally/; the correct wheel
 depends on your CUDA toolkit version. Example for CUDA 12.1:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Skip this step for a CPU-only install; `pip install -e .` will pull
