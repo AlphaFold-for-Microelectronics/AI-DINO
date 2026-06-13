@@ -90,16 +90,37 @@ class Crystal:
         self._cached_atom_positions = None
         self._cached_atom_frac_coords = None
 
-        # Parse atom types
-        try:
-            # If oxidation state is given, atom type is stored in element field of each specie
-            self.atom_types = list(map(str, map(lambda x: x.element, self.structure.species)))
-        except:
-            # No oxidation state given
-            self.atom_types = list(map(str, self.structure.species))
-        
+        # Parse atom types, occupancies, and site indices. Each pymatgen site
+        # may carry a Composition with multiple species at fractional
+        # occupancies (substitutional disorder). Expanding such sites into one
+        # entry per species naturally implements the Virtual Crystal
+        # Approximation in the per-atom kinematic sum:
+        #     F_site(q) = Σ_species occupancy_species · f_species(q)
+        # `_site_index` records which pymatgen site each expanded entry came
+        # from, so atom_positions / atom_frac_coords re-broadcast the site's
+        # coordinates across its expanded entries.
+        self.atom_types: list = []
+        self._occupancies: list = []
+        self._site_index: list = []
+        for site_idx, site in enumerate(self.structure.sites):
+            for sp, occu in site.species.items():
+                try:
+                    elem_str = str(sp.element)
+                except AttributeError:
+                    elem_str = str(sp)
+                self.atom_types.append(elem_str)
+                self._occupancies.append(float(occu))
+                self._site_index.append(site_idx)
+        self._site_index = np.asarray(self._site_index, dtype=np.int64)
+
         # Get atomic form factors
         self._get_atomic_form_factor_coefficients()
+
+        # Per-atom occupancy used by calculate_form_factors. Ones for fully-
+        # ordered crystals; fractional values for disordered sites.
+        self.occupancies = torch.as_tensor(
+            self._occupancies, dtype=self.dtype, device=self.device,
+        )
 
         # Set global position (default is origin)
         self._position = torch.zeros(3, dtype=self.dtype, device=self.device)
@@ -245,16 +266,18 @@ class Crystal:
     @property
     def atom_positions(self) -> Tensor:
         if self._cached_atom_positions is None:
+            coords = self.structure.cart_coords[self._site_index]
             self._cached_atom_positions = torch.tensor(
-                self.structure.cart_coords * 1e-10, dtype=self.dtype, device=self.device
+                coords * 1e-10, dtype=self.dtype, device=self.device
             )
         return self._cached_atom_positions
 
     @property
     def atom_frac_coords(self) -> Tensor:
         if self._cached_atom_frac_coords is None:
+            coords = self.structure.frac_coords[self._site_index]
             self._cached_atom_frac_coords = torch.tensor(
-                self.structure.frac_coords, dtype=self.dtype, device=self.device
+                coords, dtype=self.dtype, device=self.device
             )
         return self._cached_atom_frac_coords
 
@@ -298,7 +321,10 @@ class Crystal:
         lines.append("Generated from pymatgen Structure")
     
         for site in structure:
-            el = site.specie.symbol
+            # Pick the majority species at each site (XYZ format carries no
+            # occupancy, so disordered sites are rendered as the dominant element).
+            sp = max(site.species.items(), key=lambda kv: kv[1])[0]
+            el = sp.symbol if hasattr(sp, 'symbol') else str(sp)
             x, y, z = site.coords
             lines.append(f"{el} {x:.6f} {y:.6f} {z:.6f}")
     
@@ -572,14 +598,16 @@ class Crystal:
         
         gaussian_terms = self.coeff_a.view(1,-1) * torch.exp(-self.coeff_b.view(1,-1) * s_squared)
         f0 = gaussian_terms.view(-1, self.n_atoms, 4).sum(dim=-1) + self.coeff_c
-        
+
         if self.include_anomalous:
             # f(q,E) = f0(q) + f'(E) + i*f''(E)
-            f_real = f0 + self.f_prime
-            f_imag = self.f_double_prime
-            return torch.complex(f_real, f_imag)
+            f = torch.complex(f0 + self.f_prime, self.f_double_prime)
         else:
-            return f0
+            f = f0
+
+        # Per-atom occupancy weight (VCA): for disordered sites, the expanded
+        # per-species entries each contribute their fractional occupancy.
+        return self.occupancies.view(1, -1) * f
             
     def get_penetration_depth(self, wavelength: Optional[float] = None) -> float:
         """
