@@ -540,8 +540,11 @@ class Kuramoto3D(ODE):
             Initial phase configuration of shape (M, 1, Nx, Ny, Nz) with phases
             uniformly distributed in [0, 2π].
         """
-        torch.manual_seed(seed)
-        return 2 * torch.pi * torch.rand((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype)
+        # Local generator: seeding scopes to this tensor, doesn't touch global RNG.
+        gen = torch.Generator(device='cpu').manual_seed(seed) if seed is not None else None
+        return 2 * torch.pi * torch.rand(
+            (M, 1, self.Nx, self.Ny, self.Nz), generator=gen, dtype=self.dtype,
+        )
 
     def forward(self, t, y):
         """
@@ -752,10 +755,13 @@ class KuramotoQuasi2D(ODE):
             Initial phase configuration of shape (M, 1, Nx, Ny, Nz) with phases
             uniformly distributed in [0, 2π], identical across all z-slices.
         """
-        torch.manual_seed(seed)
+        # Local generator: seeding scopes to this tensor, doesn't touch global RNG.
+        gen = torch.Generator(device='cpu').manual_seed(seed) if seed is not None else None
 
         # Generate 2D initial state and replicate across z-dimension
-        y0_2d = 2 * np.pi * torch.rand((M, 1, self.Nx, self.Ny), dtype=self.dtype)
+        y0_2d = 2 * np.pi * torch.rand(
+            (M, 1, self.Nx, self.Ny), generator=gen, dtype=self.dtype,
+        )
         return y0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
 
     def forward(self, t, y):
@@ -897,8 +903,11 @@ class CahnHilliard3D(ODE):
         torch.Tensor
             Initial state tensor of shape (M, 1, Nx, Ny, Nz).
         """
-        torch.manual_seed(seed)
-        return mean + sigma * torch.randn((M, 1, self.Nx, self.Ny, self.Nz), dtype=self.dtype)
+        # Local generator: seeding scopes to this tensor, doesn't touch global RNG.
+        gen = torch.Generator(device='cpu').manual_seed(seed) if seed is not None else None
+        return mean + sigma * torch.randn(
+            (M, 1, self.Nx, self.Ny, self.Nz), generator=gen, dtype=self.dtype,
+        )
 
     def forward(self, t, c):
         """
@@ -1033,10 +1042,13 @@ class CahnHilliardQuasi2D(ODE):
             Initial state tensor of shape (M, 1, Nx, Ny, Nz) with random noise,
             identical across all z-slices.
         """
-        torch.manual_seed(seed)
+        # Local generator: seeding scopes to this tensor, doesn't touch global RNG.
+        gen = torch.Generator(device='cpu').manual_seed(seed) if seed is not None else None
 
         # Generate 2D initial state and replicate across z-dimension
-        c0_2d = mean + sigma * torch.randn((M, 1, self.Nx, self.Ny), dtype=self.dtype)
+        c0_2d = mean + sigma * torch.randn(
+            (M, 1, self.Nx, self.Ny), generator=gen, dtype=self.dtype,
+        )
         return c0_2d.unsqueeze(-1).expand(-1, -1, -1, -1, self.Nz)
 
     def forward(self, t, c):
