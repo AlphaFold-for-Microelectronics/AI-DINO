@@ -453,14 +453,12 @@ class BraggCoherentDiffraction:
             spacing in Δq becomes M× finer, letting bilinear interpolation
             resolve speckle fringes that would otherwise be lost between bins.
 
-            Recommended: ``fft_oversampling = max(2 * ceil(beta), 8)``, where
+            Recommended: ``fft_oversampling = 2 * ceil(beta)``, where
             ``beta`` comes from
             ``Detector.calculate_oversampling_ratio(crystal.crystal_volume)``.
             The ``2 * beta`` term ensures the FFT bin spacing is at least as
             fine as the detector pixel spacing (β = pixels-per-fringe / 2, so
-            2β = pixels per fringe); the floor of 8 keeps the bilinear
-            interpolation error per fringe to a few percent regardless of β.
-            Memory scales as M³.
+            2β = pixels per fringe). Memory scales as M³.
 
         Returns
         -------
@@ -557,7 +555,7 @@ class BraggCoherentDiffraction:
                 raise ValueError(
                     "fft_oversampling is required when method='fft'. Compute "
                     "beta = detector.calculate_oversampling_ratio(crystal.crystal_volume) "
-                    "and pass int(max(2 * ceil(beta), 8)) — see the docstring for details."
+                    "and pass int(2 * ceil(beta)) — see the docstring for details."
                 )
             # Resolve Bragg vector: explicit value, or centroid of q_vectors.
             G = bragg_vector if bragg_vector is not None else q_vectors.reshape(-1, 3).mean(dim=0)

@@ -493,11 +493,11 @@ def make_supercell_grid(
 
 
 def recommend_fft_oversampling(setup: BenchSetup) -> int:
-    """M = max(2 * ceil(beta), 8) using the BCDI oversampling ratio."""
+    """M = 2 * ceil(beta) using the BCDI oversampling ratio."""
     beta = setup.detector.calculate_oversampling_ratio(
         setup.crystal.crystal_volume
     ).item()
-    return int(max(2 * math.ceil(beta), 8))
+    return int(2 * math.ceil(beta))
 
 
 def recommend_supercell_size(setup: BenchSetup) -> Tuple[int, int, int]:
