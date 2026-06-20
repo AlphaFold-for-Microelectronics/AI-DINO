@@ -6,11 +6,12 @@ BaTiO3 cubic crystal with random continuum + sublattice displacement
 fields and a Gaussian-beam mask.
 
 Tests provided:
-    - test_method_vs_supercells      (time + memory, both methods)
-    - test_method_vs_batch_size      (time + memory vs frames/call, both methods)
-    - test_direct_vs_qbatch          (time + memory, direct method)
-    - test_direct_error_vs_supercell (time + memory + chi^2_0, direct)
-    - test_fft_error_vs_oversampling (time + memory + chi^2_0 + chi^2, FFT)
+    - test_method_vs_supercells          (time + memory, both methods)
+    - test_method_vs_batch_size          (time + memory vs frames/call, both methods)
+    - test_direct_vs_qbatch              (time + memory, direct method)
+    - test_direct_error_vs_supercell     (time + memory + chi^2_0, direct)
+    - test_fft_error_vs_oversampling     (time + memory + chi^2_0 + chi^2, FFT)
+    - test_custom_backward_consistency   (gradient parity, direct method)
 
 chi^2_0 is the error vs the ground-truth direct@(1,1,1) intensity (total
 approximation error — supercell + FFT combined). chi^2 (test 4 only) is the
@@ -24,6 +25,13 @@ relevant input — continuum_displacement when include_sublattice=False,
 sublattice_displacement when include_sublattice=True. OOM is trapped so
 a partial sweep records `oom=True` instead of crashing. For tests 3 & 4,
 chi^2 quantities are computed only under no_grad (independent of grad_mode).
+
+Tests 1, 2, 3, and 5 also accept `use_custom_backward_options` to compare
+the direct method's default autograd backward against its custom-gradient
+path (which avoids retaining the large per-atom intermediates in the
+backward graph). The default `(False,)` preserves existing behavior; pass
+`(False, True)` to sweep both. FFT iterations are not duplicated since
+the FFT method has no custom-backward variant.
 
 Results serialize as JSON in benchmark_results/<test_name>_<timestamp>.json.
 """
@@ -99,6 +107,7 @@ class BenchmarkResult:
     chi_squared: Optional[float] = None          # vs direct@same supercell
     n_supercells: Optional[int] = None
     fft_oversampling: Optional[int] = None
+    use_custom_backward: bool = False        # direct method's custom-grad path (False for FFT)
     oom: bool = False
     extra: dict = field(default_factory=dict)
 
@@ -525,19 +534,31 @@ def test_method_vs_supercells(
     grad_modes: Optional[Sequence[str]] = None,
     q_batch_size: int = 64,
     fft_oversampling: Optional[int] = None,
+    use_custom_backward_options: Sequence[bool] = (False,),
     n_repeats: int = 3,
     verbose: bool = False,
 ) -> List[BenchmarkResult]:
     """
     Sweep `supercell_size_grid` for both methods. Records time and peak
-    additional GPU memory per (include_sublattice, grad_mode, method);
-    no error metric. swept_value is supercell_size_product = d1*d2*d3.
+    additional GPU memory per (include_sublattice, grad_mode, method,
+    use_custom_backward); no error metric. swept_value is
+    supercell_size_product = d1*d2*d3.
+
+    `use_custom_backward_options` (default `(False,)`) toggles the direct
+    method's custom-backward path. FFT iterations only run once per other-
+    axis combination since FFT has no custom-backward variant.
     """
     results: List[BenchmarkResult] = []
     M = fft_oversampling or recommend_fft_oversampling(setup)
 
+    # FFT method has no custom-backward path; restrict its iterations to (False,).
+    direct_opts = tuple(use_custom_backward_options)
+    fft_opts = (False,) if False in direct_opts else direct_opts[:1]
+    opts_for = lambda m: direct_opts if m == 'direct' else fft_opts
+
     total = sum(
-        len(supercell_size_grid) * len(methods) *
+        len(supercell_size_grid) *
+        sum(len(opts_for(m)) for m in methods) *
         len(grad_modes if grad_modes is not None else _grad_modes_for(s))
         for s in include_sublattice_options
     )
@@ -550,59 +571,63 @@ def test_method_vs_supercells(
             n_sc = _n_supercells(setup.crystal_size, sc_size)
             for method in methods:
                 for grad_mode in modes:
-                    pbar.update(1)
-                    # Release the previous iteration's amplitude (+ any retained
-                    # autograd graph) so it doesn't sit in GPU memory through
-                    # the next config's measurement.
-                    _amp = None
-                    _, do_bwd = _parse_grad_mode(grad_mode)
-                    _cleanup(setup.device)
-                    try:
-                        data = make_data_inputs(
-                            setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                    for use_custom in opts_for(method):
+                        pbar.update(1)
+                        # Release the previous iteration's amplitude (+ any retained
+                        # autograd graph) so it doesn't sit in GPU memory through
+                        # the next config's measurement.
+                        _amp = None
+                        _, do_bwd = _parse_grad_mode(grad_mode)
+                        _cleanup(setup.device)
+                        try:
+                            data = make_data_inputs(
+                                setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                            )
+                        except ValueError:
+                            continue  # sublattice mode without sublattice — skip
+
+                        call_kwargs = {**data}
+                        if method == 'direct':
+                            call_kwargs['q_batch_size'] = q_batch_size
+                            call_kwargs['use_custom_backward'] = use_custom
+                        elif method == 'fft':
+                            call_kwargs['method'] = 'fft'
+                            call_kwargs['bragg_vector'] = setup.bragg_vector
+                            call_kwargs['fft_oversampling'] = M
+
+                        def call_fn():
+                            return setup.simulator.calculate_supercell_scattering(
+                                setup.q_vectors, sc_size, **call_kwargs
+                            )
+
+                        elapsed, peak, _amp = measure_call(
+                            call_fn,
+                            backward=do_bwd,
+                            no_grad=(grad_mode == 'no_grad'),
+                            device=setup.device,
+                            n_repeats=n_repeats,
                         )
-                    except ValueError:
-                        continue  # sublattice mode without sublattice — skip
-
-                    call_kwargs = {**data}
-                    if method == 'direct':
-                        call_kwargs['q_batch_size'] = q_batch_size
-                    elif method == 'fft':
-                        call_kwargs['method'] = 'fft'
-                        call_kwargs['bragg_vector'] = setup.bragg_vector
-                        call_kwargs['fft_oversampling'] = M
-
-                    def call_fn():
-                        return setup.simulator.calculate_supercell_scattering(
-                            setup.q_vectors, sc_size, **call_kwargs
-                        )
-
-                    elapsed, peak, _amp = measure_call(
-                        call_fn,
-                        backward=do_bwd,
-                        no_grad=(grad_mode == 'no_grad'),
-                        device=setup.device,
-                        n_repeats=n_repeats,
-                    )
-                    oom = math.isnan(elapsed)
-                    results.append(BenchmarkResult(
-                        test_name='method_vs_supercells',
-                        swept_param='supercell_size_product',
-                        swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
-                        method=method,
-                        include_sublattice=include_sub,
-                        grad_mode=grad_mode,
-                        elapsed_time_s=elapsed if not oom else float('nan'),
-                        peak_memory_gb=peak if not oom else float('nan'),
-                        n_supercells=n_sc,
-                        fft_oversampling=M if method == 'fft' else None,
-                        oom=oom,
-                        extra={'supercell_size': list(sc_size),
-                               'q_batch_size': q_batch_size if method == 'direct' else None},
-                    ))
-                    if verbose:
-                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
-                        print(f"  [n_sc={n_sc}, {method}, sub={include_sub}, {grad_mode}] {tag}")
+                        oom = math.isnan(elapsed)
+                        results.append(BenchmarkResult(
+                            test_name='method_vs_supercells',
+                            swept_param='supercell_size_product',
+                            swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
+                            method=method,
+                            include_sublattice=include_sub,
+                            grad_mode=grad_mode,
+                            elapsed_time_s=elapsed if not oom else float('nan'),
+                            peak_memory_gb=peak if not oom else float('nan'),
+                            n_supercells=n_sc,
+                            fft_oversampling=M if method == 'fft' else None,
+                            use_custom_backward=use_custom if method == 'direct' else False,
+                            oom=oom,
+                            extra={'supercell_size': list(sc_size),
+                                   'q_batch_size': q_batch_size if method == 'direct' else None},
+                        ))
+                        if verbose:
+                            tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                            print(f"  [n_sc={n_sc}, {method}, sub={include_sub}, "
+                                  f"{grad_mode}, custom_bwd={use_custom}] {tag}")
 
     pbar.close()
     return results
@@ -618,23 +643,34 @@ def test_method_vs_batch_size(
     supercell_size: Optional[Tuple[int, int, int]] = None,
     q_batch_size: int = 64,
     fft_oversampling: Optional[int] = None,
+    use_custom_backward_options: Sequence[bool] = (False,),
     n_repeats: int = 3,
     verbose: bool = False,
 ) -> List[BenchmarkResult]:
     """
     Sweep `batch_sizes` (leading "frame" dimension) for both methods at
     fixed supercell_size. Records time and peak additional GPU memory per
-    (include_sublattice, grad_mode, method, batch_size). Useful for sizing
-    workloads where many frames (e.g., timesteps) are processed per call,
-    and for seeing how GPU saturation shifts the optimal q_batch_size.
+    (include_sublattice, grad_mode, method, batch_size,
+    use_custom_backward). Useful for sizing workloads where many frames
+    (e.g., timesteps) are processed per call, and for seeing how GPU
+    saturation shifts the optimal q_batch_size.
+
+    `use_custom_backward_options` (default `(False,)`) toggles the direct
+    method's custom-backward path. FFT iterations only run once per other-
+    axis combination since FFT has no custom-backward variant.
     """
     sc_size = supercell_size or setup.supercell_size_default
     n_sc = _n_supercells(setup.crystal_size, sc_size)
     M = fft_oversampling or recommend_fft_oversampling(setup)
     results: List[BenchmarkResult] = []
 
+    direct_opts = tuple(use_custom_backward_options)
+    fft_opts = (False,) if False in direct_opts else direct_opts[:1]
+    opts_for = lambda m: direct_opts if m == 'direct' else fft_opts
+
     total = sum(
-        len(batch_sizes) * len(methods) *
+        len(batch_sizes) *
+        sum(len(opts_for(m)) for m in methods) *
         len(grad_modes if grad_modes is not None else _grad_modes_for(s))
         for s in include_sublattice_options
     )
@@ -646,60 +682,64 @@ def test_method_vs_batch_size(
         for B in batch_sizes:
             for method in methods:
                 for grad_mode in modes:
-                    pbar.update(1)
-                    # Release the previous iteration's amplitude (+ any retained
-                    # autograd graph) so it doesn't sit in GPU memory through
-                    # the next config's measurement.
-                    _amp = None
-                    _, do_bwd = _parse_grad_mode(grad_mode)
-                    _cleanup(setup.device)
-                    try:
-                        data = make_data_inputs(
-                            setup, include_sublattice=include_sub,
-                            grad_mode=grad_mode, batch_size=B,
+                    for use_custom in opts_for(method):
+                        pbar.update(1)
+                        # Release the previous iteration's amplitude (+ any retained
+                        # autograd graph) so it doesn't sit in GPU memory through
+                        # the next config's measurement.
+                        _amp = None
+                        _, do_bwd = _parse_grad_mode(grad_mode)
+                        _cleanup(setup.device)
+                        try:
+                            data = make_data_inputs(
+                                setup, include_sublattice=include_sub,
+                                grad_mode=grad_mode, batch_size=B,
+                            )
+                        except ValueError:
+                            continue
+
+                        call_kwargs = {**data}
+                        if method == 'direct':
+                            call_kwargs['q_batch_size'] = q_batch_size
+                            call_kwargs['use_custom_backward'] = use_custom
+                        elif method == 'fft':
+                            call_kwargs['method'] = 'fft'
+                            call_kwargs['bragg_vector'] = setup.bragg_vector
+                            call_kwargs['fft_oversampling'] = M
+
+                        def call_fn():
+                            return setup.simulator.calculate_supercell_scattering(
+                                setup.q_vectors, sc_size, **call_kwargs
+                            )
+
+                        elapsed, peak, _amp = measure_call(
+                            call_fn,
+                            backward=do_bwd,
+                            no_grad=(grad_mode == 'no_grad'),
+                            device=setup.device,
+                            n_repeats=n_repeats,
                         )
-                    except ValueError:
-                        continue
-
-                    call_kwargs = {**data}
-                    if method == 'direct':
-                        call_kwargs['q_batch_size'] = q_batch_size
-                    elif method == 'fft':
-                        call_kwargs['method'] = 'fft'
-                        call_kwargs['bragg_vector'] = setup.bragg_vector
-                        call_kwargs['fft_oversampling'] = M
-
-                    def call_fn():
-                        return setup.simulator.calculate_supercell_scattering(
-                            setup.q_vectors, sc_size, **call_kwargs
-                        )
-
-                    elapsed, peak, _amp = measure_call(
-                        call_fn,
-                        backward=do_bwd,
-                        no_grad=(grad_mode == 'no_grad'),
-                        device=setup.device,
-                        n_repeats=n_repeats,
-                    )
-                    oom = math.isnan(elapsed)
-                    results.append(BenchmarkResult(
-                        test_name='method_vs_batch_size',
-                        swept_param='batch_size',
-                        swept_value=int(B),
-                        method=method,
-                        include_sublattice=include_sub,
-                        grad_mode=grad_mode,
-                        elapsed_time_s=elapsed if not oom else float('nan'),
-                        peak_memory_gb=peak if not oom else float('nan'),
-                        n_supercells=n_sc,
-                        fft_oversampling=M if method == 'fft' else None,
-                        oom=oom,
-                        extra={'supercell_size': list(sc_size),
-                               'q_batch_size': q_batch_size if method == 'direct' else None},
-                    ))
-                    if verbose:
-                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
-                        print(f"  [B={B}, {method}, sub={include_sub}, {grad_mode}] {tag}")
+                        oom = math.isnan(elapsed)
+                        results.append(BenchmarkResult(
+                            test_name='method_vs_batch_size',
+                            swept_param='batch_size',
+                            swept_value=int(B),
+                            method=method,
+                            include_sublattice=include_sub,
+                            grad_mode=grad_mode,
+                            elapsed_time_s=elapsed if not oom else float('nan'),
+                            peak_memory_gb=peak if not oom else float('nan'),
+                            n_supercells=n_sc,
+                            fft_oversampling=M if method == 'fft' else None,
+                            use_custom_backward=use_custom if method == 'direct' else False,
+                            oom=oom,
+                            extra={'supercell_size': list(sc_size),
+                                   'q_batch_size': q_batch_size if method == 'direct' else None},
+                        ))
+                        if verbose:
+                            tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                            print(f"  [B={B}, {method}, sub={include_sub}, "
+                                  f"{grad_mode}, custom_bwd={use_custom}] {tag}")
 
     pbar.close()
     return results
@@ -712,17 +752,26 @@ def test_direct_vs_qbatch(
     include_sublattice_options: Sequence[bool] = (False, True),
     grad_modes: Optional[Sequence[str]] = None,
     supercell_size: Optional[Tuple[int, int, int]] = None,
+    use_custom_backward_options: Sequence[bool] = (False,),
     n_repeats: int = 3,
     verbose: bool = False,
 ) -> List[BenchmarkResult]:
-    """Sweep `q_batch_size` for the direct method. Records time + memory."""
+    """Sweep `q_batch_size` for the direct method. Records time + memory
+    per (include_sublattice, grad_mode, q_batch_size, use_custom_backward).
+
+    `use_custom_backward_options` (default `(False,)`) toggles the direct
+    method's custom-backward path. Pass `(False, True)` to compare both;
+    each combination is recorded as a separate `BenchmarkResult` with the
+    `use_custom_backward` field distinguishing them.
+    """
     sc_size = supercell_size or setup.supercell_size_default
     n_sc = _n_supercells(setup.crystal_size, sc_size)
     results: List[BenchmarkResult] = []
 
     total = sum(
         len(q_batch_sizes) *
-        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s)) *
+        len(use_custom_backward_options)
         for s in include_sublattice_options
     )
     pbar = tqdm(total=total, disable=verbose,
@@ -732,49 +781,189 @@ def test_direct_vs_qbatch(
         modes = grad_modes if grad_modes is not None else _grad_modes_for(include_sub)
         for qbs in q_batch_sizes:
             for grad_mode in modes:
-                pbar.update(1)
-                # Release the previous iteration's amplitude (+ any retained
-                # autograd graph) so it doesn't sit in GPU memory through
-                # the next config's measurement.
-                _amp = None
-                _, do_bwd = _parse_grad_mode(grad_mode)
-                _cleanup(setup.device)
-                try:
-                    data = make_data_inputs(
-                        setup, include_sublattice=include_sub, grad_mode=grad_mode,
-                    )
-                except ValueError:
-                    continue
+                for use_custom in use_custom_backward_options:
+                    pbar.update(1)
+                    # Release the previous iteration's amplitude (+ any retained
+                    # autograd graph) so it doesn't sit in GPU memory through
+                    # the next config's measurement.
+                    _amp = None
+                    _, do_bwd = _parse_grad_mode(grad_mode)
+                    _cleanup(setup.device)
+                    try:
+                        data = make_data_inputs(
+                            setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                        )
+                    except ValueError:
+                        continue
 
-                def call_fn():
-                    return setup.simulator.calculate_supercell_scattering(
-                        setup.q_vectors, sc_size, q_batch_size=qbs, **data
-                    )
+                    def call_fn():
+                        return setup.simulator.calculate_supercell_scattering(
+                            setup.q_vectors, sc_size, q_batch_size=qbs,
+                            use_custom_backward=use_custom, **data,
+                        )
 
-                elapsed, peak, _amp = measure_call(
-                    call_fn,
-                    backward=do_bwd,
-                    no_grad=(grad_mode == 'no_grad'),
-                    device=setup.device,
-                    n_repeats=n_repeats,
-                )
-                oom = math.isnan(elapsed)
-                results.append(BenchmarkResult(
-                    test_name='direct_vs_qbatch',
-                    swept_param='q_batch_size',
-                    swept_value=qbs,
-                    method='direct',
-                    include_sublattice=include_sub,
-                    grad_mode=grad_mode,
-                    elapsed_time_s=elapsed if not oom else float('nan'),
-                    peak_memory_gb=peak if not oom else float('nan'),
-                    n_supercells=n_sc,
-                    oom=oom,
-                    extra={'supercell_size': list(sc_size)},
-                ))
-                if verbose:
-                    tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
-                    print(f"  [qbs={qbs}, sub={include_sub}, {grad_mode}] {tag}")
+                    elapsed, peak, _amp = measure_call(
+                        call_fn,
+                        backward=do_bwd,
+                        no_grad=(grad_mode == 'no_grad'),
+                        device=setup.device,
+                        n_repeats=n_repeats,
+                    )
+                    oom = math.isnan(elapsed)
+                    results.append(BenchmarkResult(
+                        test_name='direct_vs_qbatch',
+                        swept_param='q_batch_size',
+                        swept_value=qbs,
+                        method='direct',
+                        include_sublattice=include_sub,
+                        grad_mode=grad_mode,
+                        elapsed_time_s=elapsed if not oom else float('nan'),
+                        peak_memory_gb=peak if not oom else float('nan'),
+                        n_supercells=n_sc,
+                        use_custom_backward=use_custom,
+                        oom=oom,
+                        extra={'supercell_size': list(sc_size)},
+                    ))
+                    if verbose:
+                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB'
+                        print(f"  [qbs={qbs}, sub={include_sub}, {grad_mode}, "
+                              f"custom_bwd={use_custom}] {tag}")
+
+    pbar.close()
+    return results
+
+
+def test_custom_backward_consistency(
+    setup: BenchSetup,
+    *,
+    supercell_size: Optional[Tuple[int, int, int]] = None,
+    q_batch_size: int = 64,
+    cases: Optional[Sequence[Dict[str, bool]]] = None,
+    grad_tol: float = 1e-4,
+    fwd_tol: float = 1e-6,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """Verify that ``use_custom_backward=True`` on the direct method produces
+    forward outputs and input gradients matching the default autograd path.
+
+    For each ``case`` (a dict over which inputs are present and require_grad),
+    runs forward+backward both ways on identical inputs and reports
+    ``max abs / max rel`` diff for the forward amplitude and each gradient.
+
+    Returns a list of per-case result dicts.
+
+    ``cases`` defaults to a representative subset of the 15 non-trivial
+    combinations of ``{mask, continuum, sublattice, strain}`` — pass an
+    explicit list to test other subsets (e.g. for memory benchmarking on
+    just the per-atom configurations).
+    """
+    sc_size = supercell_size or setup.supercell_size_default
+
+    if cases is None:
+        # Default: each input alone + the everything-on case.
+        cases = [
+            {'mask': True,  'continuum': False, 'sublattice': False, 'strain': False},
+            {'mask': False, 'continuum': True,  'sublattice': False, 'strain': False},
+            {'mask': False, 'continuum': False, 'sublattice': True,  'strain': False},
+            {'mask': False, 'continuum': False, 'sublattice': False, 'strain': True},
+            {'mask': True,  'continuum': True,  'sublattice': True,  'strain': True},
+        ]
+
+    results: List[Dict[str, Any]] = []
+    pbar = tqdm(total=len(cases), disable=verbose,
+                desc='custom_backward_consistency', bar_format=_BAR_FORMAT)
+    for case in cases:
+        pbar.update(1)
+        # Build identical inputs for both paths, with requires_grad set on
+        # the ones the case marks present (so we can compare their gradients).
+        inputs_def: dict = {}
+        inputs_cus: dict = {}
+
+        if case.get('mask', False):
+            base = setup.base_mask
+            inputs_def['mask'] = base.clone().detach().requires_grad_(True)
+            inputs_cus['mask'] = base.clone().detach().requires_grad_(True)
+        if case.get('continuum', False):
+            base = setup.base_continuum
+            inputs_def['continuum_displacement'] = base.clone().detach().requires_grad_(True)
+            inputs_cus['continuum_displacement'] = base.clone().detach().requires_grad_(True)
+        if case.get('sublattice', False):
+            base = setup.base_sublattice
+            inputs_def['sublattice_displacement'] = base.clone().detach().requires_grad_(True)
+            inputs_cus['sublattice_displacement'] = base.clone().detach().requires_grad_(True)
+        if case.get('strain', False):
+            n_sc1 = setup.crystal_size[0] // sc_size[0]
+            n_sc2 = setup.crystal_size[1] // sc_size[1]
+            n_sc3 = setup.crystal_size[2] // sc_size[2]
+            base = 1e-12 * torch.randn(
+                (setup.batch_size, n_sc1, n_sc2, n_sc3, 3, 3),
+                generator=torch.Generator(device=setup.device).manual_seed(0),
+                dtype=setup.dtype, device=setup.device,
+            )
+            inputs_def['lattice_strain'] = base.clone().detach().requires_grad_(True)
+            inputs_cus['lattice_strain'] = base.clone().detach().requires_grad_(True)
+
+        common = dict(
+            q_vectors=setup.q_vectors,
+            supercell_size=sc_size,
+            q_batch_size=q_batch_size,
+            method='direct',
+        )
+        amp_def = setup.simulator.calculate_supercell_scattering(
+            **common, use_custom_backward=False, **inputs_def,
+        )
+        amp_cus = setup.simulator.calculate_supercell_scattering(
+            **common, use_custom_backward=True,  **inputs_cus,
+        )
+
+        fwd_abs = (amp_def - amp_cus).abs().max().item()
+        fwd_scale = amp_def.abs().max().item() + 1e-30
+        fwd_rel = fwd_abs / fwd_scale
+
+        # Real scalar loss for backward: sum of intensities (= sum |F|^2).
+        (amp_def.abs() ** 2).sum().backward()
+        (amp_cus.abs() ** 2).sum().backward()
+
+        grad_diffs: Dict[str, Dict[str, float]] = {}
+        for name in inputs_def:
+            g_def = inputs_def[name].grad
+            g_cus = inputs_cus[name].grad
+            d = (g_def - g_cus).abs().max().item()
+            scale = g_def.abs().max().item() + 1e-30
+            grad_diffs[name] = {
+                'max_abs_diff': d,
+                'max_rel_diff': d / scale,
+                'grad_max_abs': g_def.abs().max().item(),
+            }
+
+        fwd_ok = fwd_rel < fwd_tol
+        grads_ok = all(g['max_rel_diff'] < grad_tol for g in grad_diffs.values())
+        result = {
+            'case': dict(case),
+            'forward_max_abs_diff': fwd_abs,
+            'forward_max_rel_diff': fwd_rel,
+            'forward_ok': fwd_ok,
+            'gradients': grad_diffs,
+            'all_gradients_ok': grads_ok,
+            'pass': fwd_ok and grads_ok,
+        }
+        results.append(result)
+
+        if verbose:
+            status = 'PASS' if result['pass'] else 'FAIL'
+            present = ', '.join(k for k, v in case.items() if v) or 'none'
+            print(f"  [{status}] case=[{present}]  fwd_rel={fwd_rel:.2e}")
+            for name, d in grad_diffs.items():
+                print(f"         grad/{name}: rel={d['max_rel_diff']:.2e}, "
+                      f"abs={d['max_abs_diff']:.2e}, scale={d['grad_max_abs']:.2e}")
+
+        # Detach gradients between cases (defensive, avoids accumulation if
+        # the caller reuses the same setup.base_* tensors with grad enabled).
+        for x in inputs_def.values():
+            if x.grad is not None: x.grad = None
+        for x in inputs_cus.values():
+            if x.grad is not None: x.grad = None
+        _cleanup(setup.device)
 
     pbar.close()
     return results
@@ -796,26 +985,33 @@ def test_direct_error_vs_supercell(
     include_sublattice_options: Sequence[bool] = (False, True),
     grad_modes: Optional[Sequence[str]] = None,
     q_batch_size: int = 64,
+    use_custom_backward_options: Sequence[bool] = (False,),
     n_repeats: int = 3,
     verbose: bool = False,
 ) -> List[BenchmarkResult]:
     """
     Direct method only. For each include_sublattice, compute a reference
     intensity at supercell_size=(1,1,1) under no_grad, then sweep
-    `supercell_sizes` recording time and memory per grad_mode plus chi^2
-    vs the reference (computed once per swept value under no_grad — chi^2
-    is independent of grad_mode).
+    `supercell_sizes` recording time and memory per (grad_mode,
+    use_custom_backward) plus chi^2 vs the reference (computed once per
+    swept value under no_grad — chi^2 is independent of grad_mode and of
+    use_custom_backward).
 
     The reference itself is the first entry — chi^2 should be ~0.
+
+    `use_custom_backward_options` (default `(False,)`) toggles the
+    direct method's custom-backward path.
     """
     if tuple(supercell_sizes[0]) != (1, 1, 1):
         raise ValueError("supercell_sizes[0] must be (1, 1, 1) — used as the reference.")
 
     results: List[BenchmarkResult] = []
 
+    custom_opts = tuple(use_custom_backward_options)
     total = sum(
         len(supercell_sizes) *
-        len(grad_modes if grad_modes is not None else _grad_modes_for(s))
+        len(grad_modes if grad_modes is not None else _grad_modes_for(s)) *
+        len(custom_opts)
         for s in include_sublattice_options
     )
     pbar = tqdm(total=total, disable=verbose,
@@ -845,60 +1041,64 @@ def test_direct_error_vs_supercell(
         for sc_size in supercell_sizes:
             n_sc = _n_supercells(setup.crystal_size, sc_size)
             for grad_mode in modes:
-                pbar.update(1)
-                # Release the previous iteration's amplitude (+ any retained
-                # autograd graph) so it doesn't sit in GPU memory through
-                # the next config's measurement.
-                amp = None
-                _, do_bwd = _parse_grad_mode(grad_mode)
-                _cleanup(setup.device)
-                try:
-                    data = make_data_inputs(
-                        setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                for use_custom in custom_opts:
+                    pbar.update(1)
+                    # Release the previous iteration's amplitude (+ any retained
+                    # autograd graph) so it doesn't sit in GPU memory through
+                    # the next config's measurement.
+                    amp = None
+                    _, do_bwd = _parse_grad_mode(grad_mode)
+                    _cleanup(setup.device)
+                    try:
+                        data = make_data_inputs(
+                            setup, include_sublattice=include_sub, grad_mode=grad_mode,
+                        )
+                    except ValueError:
+                        continue
+
+                    def call_fn():
+                        return setup.simulator.calculate_supercell_scattering(
+                            setup.q_vectors, sc_size, q_batch_size=q_batch_size,
+                            use_custom_backward=use_custom, **data,
+                        )
+
+                    elapsed, peak, amp = measure_call(
+                        call_fn,
+                        backward=do_bwd,
+                        no_grad=(grad_mode == 'no_grad'),
+                        device=setup.device,
+                        n_repeats=n_repeats,
                     )
-                except ValueError:
-                    continue
+                    oom = math.isnan(elapsed)
+                    chi2_0: Optional[float] = None
+                    # chi^2 is independent of grad_mode (depends only on the forward
+                    # amplitude), so compute it once per swept value under no_grad.
+                    # Skip the (1, 1, 1) reference itself since chi^2 vs itself is 0.
+                    if (not oom and amp is not None and grad_mode == 'no_grad'
+                            and tuple(sc_size) != (1, 1, 1)):
+                        intensity = amp.abs() ** 2
+                        chi2_0 = chi_squared(intensity.detach(), intensity_ref)
 
-                def call_fn():
-                    return setup.simulator.calculate_supercell_scattering(
-                        setup.q_vectors, sc_size, q_batch_size=q_batch_size, **data,
-                    )
-
-                elapsed, peak, amp = measure_call(
-                    call_fn,
-                    backward=do_bwd,
-                    no_grad=(grad_mode == 'no_grad'),
-                    device=setup.device,
-                    n_repeats=n_repeats,
-                )
-                oom = math.isnan(elapsed)
-                chi2_0: Optional[float] = None
-                # chi^2 is independent of grad_mode (depends only on the forward
-                # amplitude), so compute it once per swept value under no_grad.
-                # Skip the (1, 1, 1) reference itself since chi^2 vs itself is 0.
-                if (not oom and amp is not None and grad_mode == 'no_grad'
-                        and tuple(sc_size) != (1, 1, 1)):
-                    intensity = amp.abs() ** 2
-                    chi2_0 = chi_squared(intensity.detach(), intensity_ref)
-
-                results.append(BenchmarkResult(
-                    test_name='direct_error_vs_supercell',
-                    swept_param='supercell_size_product',
-                    swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
-                    method='direct',
-                    include_sublattice=include_sub,
-                    grad_mode=grad_mode,
-                    elapsed_time_s=elapsed if not oom else float('nan'),
-                    peak_memory_gb=peak if not oom else float('nan'),
-                    chi_squared_0=chi2_0,
-                    n_supercells=n_sc,
-                    oom=oom,
-                    extra={'supercell_size': list(sc_size),
-                           'q_batch_size': q_batch_size},
-                ))
-                if verbose:
-                    tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB, chi2_0={chi2_0:.2e}'
-                    print(f"  [sc={sc_size}, sub={include_sub}, {grad_mode}] {tag}")
+                    results.append(BenchmarkResult(
+                        test_name='direct_error_vs_supercell',
+                        swept_param='supercell_size_product',
+                        swept_value=int(sc_size[0] * sc_size[1] * sc_size[2]),
+                        method='direct',
+                        include_sublattice=include_sub,
+                        grad_mode=grad_mode,
+                        elapsed_time_s=elapsed if not oom else float('nan'),
+                        peak_memory_gb=peak if not oom else float('nan'),
+                        chi_squared_0=chi2_0,
+                        n_supercells=n_sc,
+                        use_custom_backward=use_custom,
+                        oom=oom,
+                        extra={'supercell_size': list(sc_size),
+                               'q_batch_size': q_batch_size},
+                    ))
+                    if verbose:
+                        tag = 'OOM' if oom else f't={elapsed:.3f}s, mem={peak:.3f}GB, chi2_0={chi2_0:.2e}'
+                        print(f"  [sc={sc_size}, sub={include_sub}, {grad_mode}, "
+                              f"custom_bwd={use_custom}] {tag}")
 
         # Drop the reference before moving to next include_sub.
         del intensity_ref
@@ -1079,7 +1279,9 @@ _X_LABELS = {
 
 # Grad-mode category for plotting. The continuum/sublattice distinction is
 # implied by the panel (see _grad_modes_for); the legend just shows the
-# direction of the gradient.
+# direction of the gradient. The direct method's custom-gradient backward
+# path is rendered in the same color as its default counterpart but with
+# a dashed line — see plot_sweep.
 _GRAD_CATEGORIES = ('No grad', 'Forward', 'Backward')
 _GRAD_CATEGORY = {
     'no_grad': 'No grad',
@@ -1145,9 +1347,17 @@ def plot_sweep(
     A single shared legend lives to the right of the rightmost panel:
         - marker shape: method (Direct: circle, FFT: square)
         - line color:   grad-mode category (No grad, Forward, Backward)
+        - line style:   custom-backward variant — solid is the default
+                        autograd path; dashed is the direct method's
+                        custom-gradient path (`use_custom_backward=True`).
+                        Custom variants share their default's color so the
+                        legend reads "Forward / Forward (custom)" etc.
+                        Only shown when the result set contains custom rows.
     The displacement target the gradient is taken w.r.t. (continuum or
     sublattice) is implied by the panel — see `_grad_modes_for` for the
-    pairing per `include_sublattice` setting.
+    pairing per `include_sublattice` setting. `no_grad` is genuinely
+    identical for custom vs default (no autograd graph either way), so its
+    records are deduplicated and plotted as a single line.
 
     Uses aidino.plot_utils.format_axis for typography and the cmcrameri
     `batlow` colormap (falls back to viridis if cmcrameri is unavailable).
@@ -1226,7 +1436,10 @@ def plot_sweep(
             twin_axes.append(ax_t)
 
     methods_seen: set = set()
-    cats_seen: set = set()
+    # Tracks (category, is_custom) tuples actually drawn — used to build the
+    # 5-entry legend (No grad, Forward[, Forward (custom)], Backward[,
+    # Backward (custom)]) only including the variants that show up.
+    variants_seen: set = set()
     twins_plotted: set = set()
 
     for panel_idx, (ax, facet_val) in enumerate(zip(axes, facet_values)):
@@ -1240,27 +1453,55 @@ def plot_sweep(
 
         for gv in group_vals:
             for gm in grad_modes_present:
-                pts = [
-                    r for r in subset
-                    if getattr(r, group_by) == gv and r.grad_mode == gm
-                    and not r.oom and getattr(r, y) is not None
-                ]
-                if not pts:
-                    continue
-                pts.sort(key=lambda r: r.swept_value)
-                xs = [r.swept_value for r in pts]
-                ys = [getattr(r, y) for r in pts]
                 category = _GRAD_CATEGORY.get(gm, gm)
-                color = cat_color.get(category, 'black')
-                marker = _MARKERS_BY_METHOD.get(gv, 'o') if group_by == 'method' else 'o'
-                if group_by == 'method':
-                    methods_seen.add(gv)
-                cats_seen.add(category)
-                ax.plot(
-                    xs, ys,
-                    marker=marker, color=color,
-                    linestyle='-', linewidth=1, markersize=5,
-                )
+                # no_grad is genuinely identical under custom vs default (the
+                # autograd graph isn't built either way), so dedupe and plot
+                # one solid line. Forward and Backward both retain different
+                # amounts in the graph depending on use_custom_backward, so
+                # plot them as paired lines (solid=default, dashed=custom).
+                if category == 'No grad':
+                    custom_values: tuple = (None,)
+                else:
+                    custom_values = (False, True)
+
+                for use_custom in custom_values:
+                    if use_custom is None:
+                        candidates = [
+                            r for r in subset
+                            if getattr(r, group_by) == gv and r.grad_mode == gm
+                            and not r.oom and getattr(r, y) is not None
+                        ]
+                        # Dedupe by swept_value — multiple records with the
+                        # same x are identical when use_custom is irrelevant.
+                        seen_x: set = set()
+                        pts: list = []
+                        for r in candidates:
+                            if r.swept_value not in seen_x:
+                                pts.append(r)
+                                seen_x.add(r.swept_value)
+                    else:
+                        pts = [
+                            r for r in subset
+                            if getattr(r, group_by) == gv and r.grad_mode == gm
+                            and r.use_custom_backward == use_custom
+                            and not r.oom and getattr(r, y) is not None
+                        ]
+                    if not pts:
+                        continue
+                    pts.sort(key=lambda r: r.swept_value)
+                    xs = [r.swept_value for r in pts]
+                    ys = [getattr(r, y) for r in pts]
+                    color = cat_color.get(category, 'black')
+                    linestyle = '--' if use_custom else '-'
+                    marker = _MARKERS_BY_METHOD.get(gv, 'o') if group_by == 'method' else 'o'
+                    if group_by == 'method':
+                        methods_seen.add(gv)
+                    variants_seen.add((category, bool(use_custom)))
+                    ax.plot(
+                        xs, ys,
+                        marker=marker, color=color,
+                        linestyle=linestyle, linewidth=1, markersize=5,
+                    )
 
         if y_twin_list:
             ax_t = twin_axes[panel_idx]
@@ -1356,14 +1597,29 @@ def plot_sweep(
                 plt.setp(ax_t.get_yticklabels(), visible=False)
                 plt.setp(ax_t.get_yticklabels(minor=True), visible=False)
 
-    # Build the shared legend: grad categories (colored lines), then methods
-    # (shaped markers in neutral black), then twin entry, then vlines.
+    # Build the shared legend: grad-category variants (color + linestyle),
+    # then methods (shaped markers in neutral black), then twin, then vlines.
+    # Variant order pairs default with custom: No grad, Forward,
+    # Forward (custom), Backward, Backward (custom). Only seen variants
+    # appear; custom variants get a dashed line in the same category color.
     proxies: list = []
     labels: list = []
-    for cat in _GRAD_CATEGORIES:
-        if cat in cats_seen:
-            proxies.append(Line2D([0], [0], color=cat_color[cat], linewidth=1.5))
-            labels.append(cat)
+    _variant_order = [
+        ('No grad', False),
+        ('Forward', False),
+        ('Forward', True),
+        ('Backward', False),
+        ('Backward', True),
+    ]
+    for cat, is_custom in _variant_order:
+        if (cat, is_custom) not in variants_seen:
+            continue
+        label = f'{cat} (custom)' if is_custom else cat
+        linestyle = '--' if is_custom else '-'
+        proxies.append(Line2D(
+            [0], [0], color=cat_color[cat], linewidth=1.5, linestyle=linestyle,
+        ))
+        labels.append(label)
     if group_by == 'method' and len(methods_seen) > 1:
         # Only show method markers in the legend when more than one method
         # is plotted — otherwise the marker shape carries no information.

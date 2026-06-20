@@ -392,6 +392,7 @@ class BraggCoherentDiffraction:
         method: str = 'direct',
         bragg_vector: Optional[Tensor] = None,
         fft_oversampling: Optional[int] = None,
+        use_custom_backward: bool = False,
     ) -> Tensor:
         """
         Calculate scattering with the supercell approach from Mokhtar et al.
@@ -459,6 +460,14 @@ class BraggCoherentDiffraction:
             The ``2 * beta`` term ensures the FFT bin spacing is at least as
             fine as the detector pixel spacing (β = pixels-per-fringe / 2, so
             2β = pixels per fringe). Memory scales as M³.
+        use_custom_backward : bool, default False
+            Direct method only. When True, routes the per-q-batch computation
+            through a custom ``torch.autograd.Function`` that computes input
+            gradients analytically instead of via autograd-traced intermediates.
+            Reduces backward-pass memory by not retaining the large per-atom
+            intermediates (``[B, n_pixels, n_supercells, n_atoms]``) across the
+            q-batch loop. Forward output is bit-identical to the default path;
+            gradients agree to float precision. Ignored when ``method='fft'``.
 
         Returns
         -------
@@ -501,6 +510,37 @@ class BraggCoherentDiffraction:
             )
 
         if method == 'direct':
+            if use_custom_backward:
+                def per_batch_custom(q_batch: Tensor) -> Tensor:
+                    # Precompute per-q-batch statics; these are non-differentiable
+                    # (depend only on q_batch and crystal constants).
+                    with torch.no_grad():
+                        if has_per_atom:
+                            q_dot_r = torch.matmul(q_batch, self.crystal.atom_positions.T)
+                            basis_phase_factors = torch.exp(-1j * q_dot_r)
+                            q_magnitude = (
+                                torch.norm(q_batch, dim=-1, keepdim=True) * _Q_M_TO_INV_ANG
+                            )
+                            form_factors = self.crystal.calculate_form_factors(q_magnitude)
+                            weighted_basis = basis_phase_factors * form_factors
+                            S_q_factored = None
+                        else:
+                            weighted_basis = None
+                            S_q_factored = self.calculate_structure_factor(q_batch)
+
+                    return _DirectMethodPerBatch.apply(
+                        supercell_mask_flat,
+                        continuum_displacement_flat,
+                        sublattice_displacement_flat if has_per_atom else None,
+                        q_batch,
+                        supercell_positions,
+                        weighted_basis,
+                        S_q_factored,
+                        cells_per_supercell,
+                        has_per_atom,
+                    )
+                return self._run_q_batches(q_vectors, q_batch_size, per_batch_custom)
+
             def per_batch(q_batch: Tensor) -> Tensor:
                 if has_per_atom:
                     # Per-supercell modified F_s: structure factor depends on n.
@@ -603,3 +643,221 @@ class BraggCoherentDiffraction:
 
         else:
             raise ValueError(f"method must be 'direct' or 'fft', got {method!r}")
+
+
+class _DirectMethodPerBatch(torch.autograd.Function):
+    """Custom-gradient core for the direct-method per-q-batch computation.
+
+    Avoids retaining the large per-atom autograd intermediates
+    (``q_dot_displacements``, ``displacement_phase_factors``, shape
+    ``[B, n_pixels_in_batch, n_supercells, n_atoms]``) in the forward graph by
+    recomputing them on demand during backward. The math is identical to the
+    default-autograd path in
+    :meth:`BraggCoherentDiffraction.calculate_supercell_scattering`
+    (``method='direct'``, ``use_custom_backward=False``); gradients agree to
+    float precision.
+
+    Forward arguments (positional, in order):
+
+    Differentiable Tensor or ``None``:
+        ``supercell_mask_flat``          : ``[B, n_supercells]``
+        ``continuum_displacement_flat``  : ``[B, n_supercells, 3]``
+        ``sublattice_displacement_flat`` : ``[B, n_supercells, n_atoms, 3]``
+
+    Non-differentiated (stashed on ``ctx``):
+        ``q_batch``                      : ``[n_pixels, 3]``
+        ``supercell_positions``          : ``[n_supercells, 3]``
+        ``weighted_basis``               : complex ``[n_pixels, n_atoms]`` or
+                                           ``None`` (per-atom branch only)
+        ``S_q_factored``                 : complex ``[n_pixels]`` or ``None``
+                                           (factored branch only)
+        ``cells_per_supercell``          : int
+        ``has_per_atom``                 : bool
+
+    Returns:
+        ``scattering_batch`` : complex ``[B, n_pixels]``
+
+    Gradient convention: for real input ``x`` and complex output ``F``,
+    ``dL/dx = Re(sum grad_F * conj(dF/dx))`` where ``grad_F`` is PyTorch's
+    stored gradient (``= 2 * ∂L/∂conj(F)``, so that ``L = |F|^2`` produces
+    ``grad_F = 2 * F``).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        supercell_mask_flat,
+        continuum_displacement_flat,
+        sublattice_displacement_flat,
+        q_batch,
+        supercell_positions,
+        weighted_basis,
+        S_q_factored,
+        cells_per_supercell,
+        has_per_atom,
+    ):
+        # ---- Supercell phase factor exp(-iq · (R[n] + u_c[b, n])) ----
+        # Shared between factored and per-atom branches. Always saved for backward.
+        q_dot_R = torch.matmul(q_batch, supercell_positions.T)    # [n_pixels, n_supercells]
+        if continuum_displacement_flat is not None:
+            q_dot_u = torch.einsum('pi,bni->bpn', q_batch, continuum_displacement_flat)
+            supercell_phase = torch.exp(-1j * (q_dot_R.unsqueeze(0) + q_dot_u))
+        else:
+            supercell_phase = torch.exp(-1j * q_dot_R).unsqueeze(0)  # [1, n_pixels, n_supercells]
+
+        if has_per_atom:
+            # Per-atom branch:
+            #     F_s[b, p, n] = sum_m weighted_basis[p, m] * exp(-iq · u_sub[b, n, m])
+            #     F[b, p]      = sum_n mask[b, n] * F_s * supercell_phase * cells
+            # The big intermediates (q_dot_u_sub, displacement_phase) of shape
+            # [B, n_pixels, n_supercells, n_atoms] are computed transiently here
+            # and not saved for backward; backward recomputes them on demand.
+            q_dot_u_sub = torch.einsum(
+                'pi,bnmi->bpnm', q_batch, sublattice_displacement_flat,
+            )
+            displacement_phase = torch.exp(-1j * q_dot_u_sub)
+            F_s = torch.einsum('pm,bpnm->bpn', weighted_basis, displacement_phase)
+            del q_dot_u_sub, displacement_phase   # release before final sum
+
+            if supercell_mask_flat is not None:
+                scattering_batch = (
+                    torch.sum(
+                        F_s * supercell_phase * supercell_mask_flat.unsqueeze(1),
+                        dim=-1,
+                    ) * cells_per_supercell
+                )
+            else:
+                scattering_batch = (
+                    torch.sum(F_s * supercell_phase, dim=-1) * cells_per_supercell
+                )
+            ctx.F_s = F_s
+        else:
+            # Factored branch:
+            #     F[b, p] = S_q(q[p]) * cells * sum_n mask[b, n] * supercell_phase[b, p, n]
+            if supercell_mask_flat is not None:
+                scattering_batch = (
+                    S_q_factored.unsqueeze(0)
+                    * torch.sum(supercell_phase * supercell_mask_flat.unsqueeze(1), dim=-1)
+                    * cells_per_supercell
+                )
+            else:
+                scattering_batch = (
+                    S_q_factored.unsqueeze(0)
+                    * torch.sum(supercell_phase, dim=-1)
+                    * cells_per_supercell
+                )
+
+        # Stash for backward. Use ctx attributes (not save_for_backward) because
+        # these tensors are intermediates / non-differentiated; save_for_backward
+        # is reserved for differentiable forward inputs we want backward access to.
+        ctx.q_batch = q_batch
+        ctx.S_q_factored = S_q_factored
+        ctx.weighted_basis = weighted_basis
+        ctx.cells_per_supercell = cells_per_supercell
+        ctx.has_per_atom = has_per_atom
+        ctx.supercell_phase = supercell_phase
+        ctx.supercell_mask_flat = supercell_mask_flat
+        ctx.sublattice_displacement_flat = sublattice_displacement_flat
+        ctx.needs_grad_mask = (
+            supercell_mask_flat is not None and supercell_mask_flat.requires_grad
+        )
+        ctx.needs_grad_continuum = (
+            continuum_displacement_flat is not None
+            and continuum_displacement_flat.requires_grad
+        )
+        ctx.needs_grad_sublattice = (
+            sublattice_displacement_flat is not None
+            and sublattice_displacement_flat.requires_grad
+        )
+
+        return scattering_batch
+
+    @staticmethod
+    def backward(ctx, grad_scattering_batch):
+        q_batch              = ctx.q_batch
+        cells_per_supercell  = ctx.cells_per_supercell
+        supercell_phase      = ctx.supercell_phase           # [B or 1, n_pixels, n_supercells]
+        mask                 = ctx.supercell_mask_flat       # [B, n_supercells] or None
+
+        grad_mask = grad_continuum = grad_sublattice = None
+
+        # coupled[b, p, n] = (per_atom: F_s[b, p, n]; factored: S_q[p]) * cells * supercell_phase[b, p, n]
+        # F[b, p] = sum_n mask[b, n] * coupled[b, p, n]   (sum_n coupled when no mask)
+        if ctx.has_per_atom:
+            F_s = ctx.F_s
+            coupled = F_s * supercell_phase * cells_per_supercell
+        else:
+            S_q_factored = ctx.S_q_factored
+            coupled = (
+                S_q_factored.unsqueeze(0).unsqueeze(-1)
+                * supercell_phase
+                * cells_per_supercell
+            )  # broadcast over B if supercell_phase has batch=1 (no continuum)
+
+        # M[b, p, n] = grad_F[b, p] * conj(coupled[b, p, n]) — common factor for mask/continuum.
+        M = grad_scattering_batch.unsqueeze(-1) * coupled.conj()
+
+        if ctx.needs_grad_mask:
+            # dL/dmask[b, n] = Re(sum_p M[b, p, n])
+            grad_mask = M.sum(dim=1).real
+
+        if ctx.needs_grad_continuum:
+            # ∂F/∂u_c[b, n, i] = mask[b, n] * coupled[b, p, n] * (-i * q[p, i])
+            # dL/du_c[b, n, i] = Re(sum_p grad_F[b, p] * conj(∂F/∂u_c[b, n, i]))
+            #                  = mask[b, n] * Re(sum_p M[b, p, n] * (i * q[p, i]))
+            #                  = -mask[b, n] * Im(sum_p M[b, p, n] * q[p, i])
+            # Einsum doesn't mix complex (M) and real (q_batch) operands, so
+            # contract the imag part directly (q_batch is real, so the imag
+            # part of M*q is just imag(M)*q).
+            grad_continuum = -torch.einsum('bpn,pi->bni', M.imag, q_batch)
+            if mask is not None:
+                grad_continuum = grad_continuum * mask.unsqueeze(-1)
+
+        if ctx.needs_grad_sublattice:
+            # ∂F_s[b, p, n]/∂u_sub[b, n, m, i] = weighted_basis[p, m] * (-i q[p, i]) * exp(-iq · u_sub[b, n, m])
+            # ∂F/∂u_sub[b, n, m, i] = mask[b, n] * supercell_phase[b, p, n] * cells * ∂F_s/∂u_sub
+            # dL/du_sub[b, n, m, i]
+            #   = Re(sum_p grad_F[b, p] * conj(∂F/∂u_sub[b, n, m, i]))
+            #   = mask[b, n] * cells * Re(sum_p grad_F[b, p] * conj(supercell_phase) * conj(weighted_basis[p, m])
+            #                              * (i q[p, i]) * conj(displacement_phase[b, p, n, m]))
+            #   = -mask[b, n] * cells * Im(sum_p [...] * q[p, i])
+            #
+            # Recompute displacement_phase (the big intermediate we skipped saving).
+            weighted_basis      = ctx.weighted_basis
+            sublattice_flat     = ctx.sublattice_displacement_flat
+            q_dot_u_sub = torch.einsum('pi,bnmi->bpnm', q_batch, sublattice_flat)
+            displacement_phase = torch.exp(-1j * q_dot_u_sub)
+            del q_dot_u_sub
+
+            # X[b, p, n] = grad_F[b, p] * conj(supercell_phase[b, p, n]),
+            #             optionally weighted by mask[b, n].
+            X = grad_scattering_batch.unsqueeze(-1) * supercell_phase.conj()
+            if mask is not None:
+                X = X * mask.unsqueeze(1)  # mask[b, 1, n_sc]
+
+            # aux[b, p, n, m] = X * conj(weighted_basis[p, m]) * conj(displacement_phase[b, p, n, m])
+            aux = (
+                X.unsqueeze(-1)
+                * weighted_basis.conj().unsqueeze(0).unsqueeze(2)
+                * displacement_phase.conj()
+            )
+            del displacement_phase
+
+            # grad_sub[b, n, m, i] = -cells * Im(sum_p aux[b, p, n, m] * q[p, i])
+            # Use einsum on aux.imag (real) so we don't need a complex q.
+            grad_sublattice = -cells_per_supercell * torch.einsum(
+                'bpnm,pi->bnmi', aux.imag, q_batch,
+            )
+
+        # Return one grad per positional forward arg.
+        return (
+            grad_mask,
+            grad_continuum,
+            grad_sublattice,
+            None,  # q_batch
+            None,  # supercell_positions
+            None,  # weighted_basis
+            None,  # S_q_factored
+            None,  # cells_per_supercell
+            None,  # has_per_atom
+        )
