@@ -128,17 +128,54 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _gpu_name() -> str:
+# Module-level session-device override. Set once at the top of a notebook via
+# set_session_device('cuda:2') and all subsequent save_results / figure_path /
+# session_dir calls use it. Without it, helpers fall back to
+# torch.cuda.current_device(), which is NOT changed by a bare `device = 'cuda:N'`
+# assignment in user code — only by `torch.cuda.set_device(N)`.
+_SESSION_DEVICE: 'str | int | torch.device | None' = None
+
+
+def set_session_device(device: 'str | int | torch.device | None') -> None:
+    """Set (or clear with None) the module-level device used to name session
+    directories. Recommended once at the top of a benchmarking notebook:
+
+        from aidino.benchmark import set_session_device
+        device = 'cuda:2'
+        set_session_device(device)
+
+    After that, every save_results / figure_path / session_dir call uses this
+    device for the folder name without needing an explicit `device=` kwarg.
+    Per-call `device=` arguments still override this when given.
+    """
+    global _SESSION_DEVICE
+    _SESSION_DEVICE = device
+
+
+def _gpu_name(device: 'str | int | torch.device | None' = None) -> str:
     """Sanitized GPU name suitable for use in a directory name.
 
-    Falls back to 'cpu' when CUDA isn't available. Non-alphanumeric
-    characters (spaces, slashes, etc.) are collapsed to underscores so
-    the resulting string is path-safe across shells.
+    Resolution order for the device:
+        1. The `device` argument if explicitly given (not None).
+        2. The module-level session device set via `set_session_device(...)`.
+        3. `torch.cuda.current_device()` if CUDA is available.
+        4. 'cpu' otherwise.
+
+    `device` accepts the same forms as `torch.device(...)`: 'cuda:N' / 'cuda'
+    string, an int N, or a `torch.device`.
     """
-    if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
+    if device is None:
+        device = _SESSION_DEVICE
+    if not torch.cuda.is_available():
+        return 'cpu'
+    if device is None:
+        index = torch.cuda.current_device()
     else:
-        name = 'cpu'
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        if dev.type == 'cpu':
+            return 'cpu'
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+    name = torch.cuda.get_device_name(index)
     return re.sub(r'[^\w.-]+', '_', name).strip('_') or 'unknown'
 
 
@@ -148,9 +185,9 @@ def session_dir(output_dir: str = '../benchmark_results') -> Path:
 
     Multiple calls on the same day with the same GPU return the same
     directory, so all JSON files and figures from one benchmark session
-    naturally land together. Caller is responsible for providing
-    `output_dir` if the caller isn't in the conventional `notebooks/`
-    directory.
+    naturally land together. The GPU is taken from the module-level
+    session device (see `set_session_device`); falls back to
+    `torch.cuda.current_device()` if none is set.
     """
     date = datetime.now().strftime('%Y-%m-%d')
     path = Path(output_dir) / f'{date}_{_gpu_name()}'
@@ -166,7 +203,7 @@ def save_results(
     """Serialize results to <session_dir>/<test_name>_<HHMMSS>.json.
 
     Results land in the per-session subdirectory of `output_dir` (see
-    `session_dir`). The filename suffix is just the wall-clock time so
+    `session_dir`). The filename suffix is the wall-clock time so
     multiple runs of the same test on the same day are disambiguated.
     """
     out_dir = session_dir(output_dir)
@@ -188,7 +225,7 @@ def figure_path(
 
     Usage:
         fig.savefig(figure_path('direct_vs_qbatch_memory'))
-        # → ../benchmark_results/2026-06-21_NVIDIA_RTX_A5000/direct_vs_qbatch_memory.png
+        # → ../benchmark_results/2026-06-21_<gpu>/direct_vs_qbatch_memory.png
 
         fig.savefig(figure_path('direct_vs_qbatch_memory', ext='pdf', timestamp=True))
         # → ../benchmark_results/<session>/direct_vs_qbatch_memory_143052.pdf
