@@ -81,11 +81,17 @@ class Beam:
     def _orthonormal_basis_perp_to(k_hat: Tensor, up: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
         Return an orthonormal basis (u, v) for the plane perpendicular to k_hat.
-        If `up` is None, defaults to lab-z (or lab-x when k_hat is near lab-z).
+
+        If `up` is None, defaults to lab-x — the codebase's vertical convention,
+        consistent with the k_i = [sin(-θ_B), 0, cos(-θ_B)] / k_f = [sin(θ_B),
+        0, cos(θ_B)] geometry used everywhere (scattering plane in x-z, lab-y
+        horizontal-perpendicular-to-beam). Falls back to lab-y in the unusual
+        case that k_hat is near-parallel to lab-x so a perpendicular basis can
+        still be built.
         """
         if up is None:
             up = torch.tensor(
-                [0., 0., 1.] if torch.abs(k_hat[2]) < 0.9 else [1., 0., 0.],
+                [1., 0., 0.] if torch.abs(k_hat[0]) < 0.9 else [0., 1., 0.],
                 device=k_hat.device, dtype=k_hat.dtype,
             )
         else:
@@ -167,9 +173,11 @@ class Beam:
             automatically determined from k_i.
         up : Tensor, optional
             Lab-frame "up" direction used to anchor the transverse basis.
-            Must not be parallel to k_i. If None, defaults to lab-z (or lab-x
-            when k_i is near lab-z), reproducing the historical heuristic.
-            Pass this to keep the transverse u/v axes stable as k_i changes.
+            Must not be parallel to k_i. If None, defaults to lab-x — the
+            codebase's vertical convention (scattering plane is x-z given the
+            standard k_i / k_f construction), falling back to lab-y if k_i is
+            unusually close to lab-x. Pass explicitly only when departing from
+            this convention.
 
         Notes
         -----
@@ -533,9 +541,12 @@ class EllipticalBeam(Beam):
 
         Notes
         -----
-        u/v are determined by Beam.create_profile from k_i and the optional
-        `up` argument. They are NOT lab-horizontal / lab-vertical unless `up`
-        is explicitly set so that u, v align with the lab axes you want.
+        u/v are determined by Beam.create_profile from k_i and the `up`
+        argument. With the default `up=None` and the codebase's standard
+        k_i geometry (scattering plane in x-z), `u` aligns with the lab
+        vertical (≈ lab-x, projected perpendicular to k_i) and `v` aligns
+        with the horizontal axis perpendicular to the scattering plane
+        (≈ lab-y). Pass `up` explicitly if you depart from this geometry.
         """
         super().__init__(wavelength)
         self.fwhm_u = fwhm_u
