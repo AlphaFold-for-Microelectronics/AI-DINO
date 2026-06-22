@@ -33,13 +33,16 @@ backward graph). The default `(False,)` preserves existing behavior; pass
 `(False, True)` to sweep both. FFT iterations are not duplicated since
 the FFT method has no custom-backward variant.
 
-Results serialize as JSON in benchmark_results/<test_name>_<timestamp>.json.
+Results serialize as JSON to a per-session subdirectory of
+benchmark_results/, named '<YYYY-MM-DD>_<gpu_name>' so JSON files and any
+figures saved via `figure_path` from the same session land together.
 """
 from __future__ import annotations
 
 import gc
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -125,25 +128,91 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _gpu_name() -> str:
+    """Sanitized GPU name suitable for use in a directory name.
+
+    Falls back to 'cpu' when CUDA isn't available. Non-alphanumeric
+    characters (spaces, slashes, etc.) are collapsed to underscores so
+    the resulting string is path-safe across shells.
+    """
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+    else:
+        name = 'cpu'
+    return re.sub(r'[^\w.-]+', '_', name).strip('_') or 'unknown'
+
+
+def session_dir(output_dir: str = '../benchmark_results') -> Path:
+    """Return (creating if needed) a shared session directory for results
+    and figures, named '<YYYY-MM-DD>_<gpu_name>'.
+
+    Multiple calls on the same day with the same GPU return the same
+    directory, so all JSON files and figures from one benchmark session
+    naturally land together. Caller is responsible for providing
+    `output_dir` if the caller isn't in the conventional `notebooks/`
+    directory.
+    """
+    date = datetime.now().strftime('%Y-%m-%d')
+    path = Path(output_dir) / f'{date}_{_gpu_name()}'
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def save_results(
     results: List[BenchmarkResult],
     test_name: str,
     output_dir: str = '../benchmark_results',
 ) -> Path:
-    """Serialize results to <output_dir>/<test_name>_<timestamp>.json.
+    """Serialize results to <session_dir>/<test_name>_<HHMMSS>.json.
 
-    The default `'../benchmark_results'` assumes the caller is in the
-    project's `notebooks/` directory and writes to the project-root
-    `benchmark_results/` (the conventional location). Override
-    `output_dir` for scripts run from elsewhere.
+    Results land in the per-session subdirectory of `output_dir` (see
+    `session_dir`). The filename suffix is just the wall-clock time so
+    multiple runs of the same test on the same day are disambiguated.
     """
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_dir = session_dir(output_dir)
+    timestamp = datetime.now().strftime('%H%M%S')
     out_path = out_dir / f'{test_name}_{timestamp}.json'
     payload = [_json_safe(asdict(r)) for r in results]
     out_path.write_text(json.dumps(payload, indent=2))
     return out_path
+
+
+def figure_path(
+    name: str,
+    *,
+    ext: str = 'png',
+    output_dir: str = '../benchmark_results',
+    timestamp: bool = False,
+) -> Path:
+    """Return a path inside today's session directory for saving a figure.
+
+    Usage:
+        fig.savefig(figure_path('direct_vs_qbatch_memory'))
+        # → ../benchmark_results/2026-06-21_NVIDIA_RTX_A5000/direct_vs_qbatch_memory.png
+
+        fig.savefig(figure_path('direct_vs_qbatch_memory', ext='pdf', timestamp=True))
+        # → ../benchmark_results/<session>/direct_vs_qbatch_memory_143052.pdf
+
+    Parameters
+    ----------
+    name : str
+        Filename stem; use underscores to separate tags
+        (e.g. f'{test_name}_{y_field}').
+    ext : str, default 'png'
+        File extension. Whatever your `fig.savefig` understands.
+    output_dir : str, default '../benchmark_results'
+        Parent directory; the session subdirectory is created inside it.
+    timestamp : bool, default False
+        Append `_HHMMSS` to the stem so multiple saves of the same name
+        within one session don't overwrite each other. Off by default so
+        that re-running a notebook cell overwrites the existing figure
+        (usually what you want during iteration).
+    """
+    out_dir = session_dir(output_dir)
+    stem = name
+    if timestamp:
+        stem = f'{name}_{datetime.now().strftime("%H%M%S")}'
+    return out_dir / f'{stem}.{ext}'
 
 
 def load_results(path: str | Path) -> List[BenchmarkResult]:
