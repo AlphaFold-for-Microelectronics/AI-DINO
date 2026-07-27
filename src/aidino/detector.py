@@ -70,7 +70,9 @@ class Detector:
         x: float
             Number to round
         digits: int
-            Number of significant digits to maintain when rounding
+            Number of significant digits to maintain when rounding.
+            If 0, returns the nearest power of `base` (i.e. base**exponent),
+            choosing whichever adjacent power is closer in absolute value.
         base: int
             Base in which to round to the nearest power
             
@@ -84,6 +86,14 @@ class Detector:
             return type(x)(0)
         else:
             exponent = np.floor(math.log(abs(x), base))
+
+            if digits == 0:
+                ax = abs(x)
+                low = base ** exponent
+                high = base ** (exponent + 1)
+                power = low if (ax - low) <= (high - ax) else high
+                return type(x)(math.copysign(power, x))
+
             scale = base ** (exponent - digits + 1)
             rounded = round(x / scale) * scale
 

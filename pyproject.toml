@@ -28,6 +28,7 @@ dependencies = [
     "networkx",
     "pandas",
     "seaborn",
+    "torchsde",
 ]
 
 [project.optional-dependencies]
