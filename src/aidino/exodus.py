@@ -209,9 +209,13 @@ class ExodusMesh:
         result = []
         for axis in range(3):
             vals = self.coords[:, axis]
-            span = vals.max() - vals.min()
+            vmin = vals.min()
+            span = vals.max() - vmin
             tol  = tol_fraction * span if span > 0 else 1e-12
-            sorted_vals = np.sort(np.unique(np.round(vals / tol).astype(int))) * tol
+            # Quantize relative to the axis minimum so the integer keys stay
+            # bounded by span/tol regardless of the coordinates' absolute offset.
+            keys = np.round((vals - vmin) / tol).astype(np.int64)
+            sorted_vals = np.sort(np.unique(keys)) * tol + vmin
             result.append(sorted_vals)
 
         xs, ys, zs = result
@@ -224,6 +228,22 @@ class ExodusMesh:
             )
         self._regular_grid_cache = (xs, ys, zs)
         return xs, ys, zs
+
+    @staticmethod
+    def _nearest_grid_index(grid: np.ndarray, coord: np.ndarray, n: int) -> np.ndarray:
+        """
+        Map each value in ``coord`` to the index of the nearest value in the
+        sorted array ``grid`` (result in [0, n-1]).
+
+        Nearest-value matching keeps the mapping exact when the grid values
+        differ from the raw node coordinates by sub-ULP amounts, as they do
+        after the round-and-rescale reconstruction in ``_infer_regular_grid``.
+        """
+        if n == 1:
+            return np.zeros(coord.shape, dtype=np.intp)
+        j = np.clip(np.searchsorted(grid, coord), 1, n - 1)  # both j-1 and j valid
+        choose_left = (coord - grid[j - 1]) <= (grid[j] - coord)
+        return np.where(choose_left, j - 1, j)
 
     def _build_node_index(
         self,
@@ -240,9 +260,20 @@ class ExodusMesh:
             return self._node_index_cache[1]
 
         nx, ny, nz = key
-        ix = np.clip(np.searchsorted(xs, self.coords[:, 0]), 0, nx - 1)
-        iy = np.clip(np.searchsorted(ys, self.coords[:, 1]), 0, ny - 1)
-        iz = np.clip(np.searchsorted(zs, self.coords[:, 2]), 0, nz - 1)
+        ix = self._nearest_grid_index(xs, self.coords[:, 0], nx)
+        iy = self._nearest_grid_index(ys, self.coords[:, 1], ny)
+        iz = self._nearest_grid_index(zs, self.coords[:, 2], nz)
+
+        # A regular mesh maps one node to each grid cell; verify the bijection
+        # so the resampled volume is fully defined on every cell.
+        lin = (ix.astype(np.int64) * ny + iy) * nz + iz
+        n_cells = nx * ny * nz
+        n_covered = np.unique(lin).size
+        if n_covered != n_cells:
+            raise ValueError(
+                f"Node-to-grid mapping covers {n_covered} of {n_cells} cells on "
+                f"the inferred {nx}×{ny}×{nz} grid; the mesh is not a regular grid."
+            )
 
         self._node_index_cache = (key, (ix, iy, iz))
         return ix, iy, iz
@@ -268,7 +299,7 @@ class ExodusMesh:
 
         sliced = field[ts]          # [T', N] — only the needed timesteps
         T_out  = sliced.shape[0]
-        volume = np.empty((T_out, nx, ny, nz), dtype=dtype or sliced.dtype)
+        volume = np.zeros((T_out, nx, ny, nz), dtype=dtype or sliced.dtype)
         volume[:, ix, iy, iz] = sliced
         return volume
 
@@ -293,16 +324,16 @@ class ExodusMesh:
         T_out = first_block[ts].shape[0]
 
         volume = np.zeros((T_out, nx, ny, nz), dtype=dtype or first_block.dtype)
-    
+
         if not hasattr(self, '_elem_index_cache'):
             self._elem_index_cache = {}
-    
+
         for block in self.element_blocks:
             if block.block_id not in field_by_block:
                 continue
             sliced = field_by_block[block.block_id][ts]  # [T', E]
             conn   = block.connectivity                   # [E, nodes_per_elem]
-    
+
             cache_key = f'_elem_idx_{block.block_id}_{len(xs)}'
             if cache_key not in self._elem_index_cache:
                 node_coords = self.coords[conn]
@@ -312,9 +343,9 @@ class ExodusMesh:
                 ez = np.clip(np.searchsorted(zs[:-1], centroids[:, 2], side='right') - 1, 0, nz-1)
                 self._elem_index_cache[cache_key] = (ex, ey, ez)
             ex, ey, ez = self._elem_index_cache[cache_key]
-    
+
             volume[:, ex, ey, ez] = sliced
-    
+
         return volume
 
     def resample_to_crystal_grid(
