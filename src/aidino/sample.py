@@ -36,6 +36,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import os
+import re
 import json
 import math
 import py3Dmol
@@ -677,6 +678,57 @@ class Crystal:
         
         return penetration_depth
 
+    def _resolve_displacement_key(self, key: str) -> List[int]:
+        """
+        Map a ``displacement_dict`` key to the atom indices it targets.
+
+        A bare element symbol (``'O'``) targets **every** atom of that element.
+        An element symbol followed by a 1-based ordinal (``'O1'``, ``'O2'``, ...)
+        targets a single atom: the k-th atom of that element in ``atom_types``
+        order. The ordinal indexes within the element (so it distinguishes
+        symmetry-equivalent sites expanded from a single CIF entry), not the CIF
+        ``_atom_site_label``.
+
+        Parameters
+        ----------
+        key : str
+            Element symbol, optionally suffixed with a 1-based ordinal.
+
+        Returns
+        -------
+        list of int
+            Indices into ``self.atom_types`` / ``self.atom_positions`` that the
+            key refers to.
+        """
+        match = re.fullmatch(r'([A-Za-z]+)(\d*)', key)
+        if match is None:
+            raise ValueError(
+                f"Invalid displacement_dict key {key!r}. Expected an element "
+                f"symbol (e.g. 'O') optionally followed by a 1-based ordinal "
+                f"(e.g. 'O2')."
+            )
+        element, ordinal = match.group(1), match.group(2)
+
+        elem_indices = [i for i, t in enumerate(self.atom_types) if t == element]
+        if not elem_indices:
+            raise KeyError(
+                f"Element {element!r} (from displacement_dict key {key!r}) is "
+                f"not present in this crystal. Available elements: "
+                f"{sorted(set(self.atom_types))}."
+            )
+
+        if ordinal == '':
+            return elem_indices
+
+        k = int(ordinal)
+        if not (1 <= k <= len(elem_indices)):
+            raise IndexError(
+                f"displacement_dict key {key!r} requests {element} #{k}, but "
+                f"this crystal has {len(elem_indices)} {element} atom(s) "
+                f"(valid ordinals 1..{len(elem_indices)})."
+            )
+        return [elem_indices[k - 1]]
+
     def create_displacement_field(self, batch_size=1, supercell_size=(1,1,1), scaling_factor=0.01, displacement_dict=None):
         """
         Generate a displacement field for atoms in a crystal structure.
@@ -702,11 +754,28 @@ class Crystal:
             scaling_factor]`` per Cartesian component. Only used when
             ``displacement_dict`` is None. Default is 0.01 (1% of a lattice vector).
         displacement_dict : dict or None, optional
-            Dictionary mapping element symbols (str) to displacement vectors **in
-            fractional lattice coordinates**. If provided, each atom type listed
-            in the dictionary is assigned its corresponding fixed displacement
-            vector, and all other atoms receive zero displacement. If None,
-            displacements are drawn randomly as above. Default is None.
+            Dictionary mapping site keys (str) to displacement vectors **in
+            fractional lattice coordinates**. Each value is broadcast against the
+            per-atom displacement slot, so it may be a scalar, a length-3 vector,
+            or a full spatially-varying field of shape
+            ``(batch_size, crystal_x, crystal_y, crystal_z, 3)``.
+
+            A key may be:
+
+            - **A bare element symbol** (e.g. ``'O'``) — applies the displacement
+              to **every** atom of that element. For a site with multiplicity > 1
+              (e.g. the three symmetry-equivalent oxygens of a perovskite), all
+              equivalent atoms are displaced identically.
+            - **An element symbol plus a 1-based ordinal** (e.g. ``'O1'``,
+              ``'O2'``, ``'O3'``) — targets a single atom: the k-th atom of that
+              element in ``atom_positions`` / ``atom_types`` order. Use this to
+              give symmetry-equivalent sites distinct displacements. The ordinal
+              indexes within the element, not the CIF ``_atom_site_label``.
+
+            Atoms not referenced by any key receive zero displacement. If two
+            keys target the same atom (e.g. both ``'O'`` and ``'O2'``), they are
+            applied in dictionary-insertion order and the later one wins. If
+            None, displacements are drawn randomly as above. Default is None.
     
         Returns
         -------
@@ -726,9 +795,12 @@ class Crystal:
                 device=self.device
             )
     
-            # Assign each element its specified displacement vector
-            for element, displacement in displacement_dict.items():
-                displacement_field[..., self.atom_types.index(element), :] = displacement
+            # Assign each key its specified displacement vector. A key resolves
+            # to one or more atom indices (all atoms of an element, or a single
+            # ordinally-selected atom); every targeted slot gets the value.
+            for key, displacement in displacement_dict.items():
+                for atom_index in self._resolve_displacement_key(key):
+                    displacement_field[..., atom_index, :] = displacement
     
         else:
             # Generate a random displacement field uniform in [-1, 1], then scale it
