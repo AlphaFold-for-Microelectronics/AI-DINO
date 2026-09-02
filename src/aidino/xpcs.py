@@ -68,7 +68,7 @@ def calculate_two_time_correlation(I):
     denom = torch.outer(mu, mu)
 
     # Return the normalized two-time correlation
-    retrun II / denom
+    return II / denom
 
 def create_annulus_mask(height, width, r_inner, thickness, center=None, device=None):
     """
