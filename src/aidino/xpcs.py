@@ -37,7 +37,12 @@ from matplotlib.patches import Circle
 
 def calculate_two_time_correlation(I):
     """
-    Compute the two-time intensity correlation matrix.
+    Compute the two-time intensity correlation matrix using the Sutton normalization:
+
+        C[t1, t2] = <I(p,t1) I(p,t2)>_p / ( <I(p,t1)>_p <I(p,t2)>_p )
+
+    where <.>_p averages over the D pixels of equivalent q.
+    I must be raw, non-negative intensity.
 
     Parameters
     ----------
@@ -51,29 +56,19 @@ def calculate_two_time_correlation(I):
         Normalized two-time correlation matrix where C[t1, t2] is the
         correlation between the spatial intensity patterns at times t1 and t2.
     """
-    
     T, D = I.shape
-
+    
     # Compute the mean intensity at each time step (average over spatial dimension)
-    I_avg = I.mean(dim=1)
-
-    # Compute the mean of squared intensities at each time step
-    I2_avg = (I**2).mean(dim=1)
-
-    # Compute the standard deviation at each time step
-    I_std = torch.sqrt(I2_avg - I_avg**2)
-
-    # Outer product of mean intensities
-    I2 = torch.outer(I_avg, I_avg)
-
-    # Outer product of standard deviations
-    Id = torch.outer(I_std, I_std)
+    mu = I.mean(dim=1)                       # <I(p,t)>_p, shape (T,)
 
     # Compute the two-time correlation matrix
-    II = (I @ I.T) / D
+    II = (I @ I.T) / D                       # <I(p,t1) I(p,t2)>_p, shape (T, T)
+    
+    # Outer product of mean intensities (normalization)
+    denom = torch.outer(mu, mu)
 
     # Return the normalized two-time correlation
-    return (II - I2) / Id
+    retrun II / denom
 
 def create_annulus_mask(height, width, r_inner, thickness, center=None, device=None):
     """
