@@ -33,7 +33,6 @@
 # ----------------------------------------------------------------------- #
 
 import torch
-from matplotlib.patches import Circle
 
 def calculate_two_time_correlation(I):
     """
@@ -70,53 +69,140 @@ def calculate_two_time_correlation(I):
     # Return the normalized two-time correlation
     return II / denom
 
-def create_annulus_mask(height, width, r_inner, thickness, center=None, device=None):
+def _delta_q_magnitude(q_vectors, q_reference=None):
     """
-    Create an annulus mask in pixel units.
+    Compute |q - q_reference| per detector pixel.
 
     Parameters
     ----------
-    height, width : int
-        Detector shape
-    r_inner : float
-        Inner radius (pixels)
-    thickness : float
-        Annulus thickness (pixels)
-    center : tuple or None
-        (cy, cx). Defaults to detector center.
-    device : torch.device or None
+    q_vectors : torch.Tensor of shape (H, W, 3)
+        Per-pixel momentum-transfer vectors, e.g. from
+        ``Detector.calculate_q_vectors``.
+    q_reference : torch.Tensor of shape (3,) or None
+        Origin in reciprocal space from which the magnitude is measured.
+        Defaults to the q vector at the detector-center pixel (the Bragg peak),
+        so equivalent-q bins are concentric about the peak. Pass a zero vector
+        to measure absolute |q| instead.
+
+    Returns
+    -------
+    dq : torch.Tensor of shape (H, W)
+        Magnitude of the deviation from ``q_reference`` at each pixel.
+    """
+    if q_reference is None:
+        height, width = q_vectors.shape[:2]
+        q_reference = q_vectors[height // 2, width // 2]
+
+    return (q_vectors - q_reference).norm(dim=-1)
+
+def create_q_annulus_mask(q_vectors, q_center, width, q_reference=None):
+    """
+    Create a mask of detector pixels of equivalent momentum transfer.
+
+    Pixels are selected by the magnitude of their deviation from a reference
+    point in reciprocal space, |q - q_reference|, using the physical per-pixel
+    q vectors. Because the true q vectors encode the full detector geometry, the
+    selected region is automatically elliptical/curved on the detector whenever
+    the geometry is anisotropic, i.e. it defines truly equivalent q without
+    assuming circular symmetry.
+
+    Parameters
+    ----------
+    q_vectors : torch.Tensor of shape (H, W, 3)
+        Per-pixel momentum-transfer vectors, e.g. from
+        ``Detector.calculate_q_vectors``.
+    q_center : float
+        Center of the q bin, in the units of ``q_vectors``.
+    width : float
+        Full width of the q bin, in the units of ``q_vectors``.
+    q_reference : torch.Tensor of shape (3,) or None
+        Origin from which |q - q_reference| is measured. Defaults to the
+        detector-center pixel (the Bragg peak). Pass a zero vector to bin on
+        absolute |q|.
 
     Returns
     -------
     mask : torch.BoolTensor of shape (H, W)
     """
-    if center is None:
-        cy = (height - 1) / 2
-        cx = (width - 1) / 2
-    else:
-        cy, cx = center
+    dq = _delta_q_magnitude(q_vectors, q_reference)
 
-    y = torch.arange(height, device=device).float()
-    x = torch.arange(width, device=device).float()
-    yy, xx = torch.meshgrid(y, x, indexing="ij")
-
-    r = torch.sqrt((yy - cy)**2 + (xx - cx)**2)
-
-    r_outer = r_inner + thickness
-    mask = (r >= r_inner) & (r < r_outer)
+    q_lower = q_center - width / 2
+    q_upper = q_center + width / 2
+    mask = (dq >= q_lower) & (dq < q_upper)
 
     return mask
 
-def draw_annulus_mask(ax, r_inner, width, center, lw=1.0, color="white"):
-    r_outer = r_inner + width
+def q_bin_centers(q_vectors, n, q_reference=None, q_min=None, q_max=None):
+    """
+    Generate ``n`` equally spaced q-bin centers spanning the observed q range.
 
-    for r in (r_inner, r_outer):
-        circ = Circle(
-            center,
-            r,
-            edgecolor=color,
-            facecolor="none",
-            linewidth=lw,
-            alpha=1.0,
-        )
-        ax.add_patch(circ)
+    Convenience for choosing the ``q_center`` values to pass to
+    ``create_q_annulus_mask``. Uses the same |q - q_reference| coordinate and
+    reference default. Consecutive bins tile the range when the bin ``width`` is
+    set to the spacing between adjacent centers.
+
+    Parameters
+    ----------
+    q_vectors : torch.Tensor of shape (H, W, 3)
+        Per-pixel momentum-transfer vectors, e.g. from
+        ``Detector.calculate_q_vectors``.
+    n : int
+        Number of bin centers to return.
+    q_reference : torch.Tensor of shape (3,) or None
+        Origin from which |q - q_reference| is measured. Defaults to the
+        detector-center pixel (the Bragg peak).
+    q_min, q_max : float or None
+        Range of bin centers. Default to ``q_max / (n + 1)`` and the maximum
+        observed |q - q_reference|, respectively.
+
+    Returns
+    -------
+    centers : torch.Tensor of shape (n,)
+    """
+    dq = _delta_q_magnitude(q_vectors, q_reference)
+
+    if q_max is None:
+        q_max = dq.max()
+    if q_min is None:
+        q_min = q_max / (n + 1)
+
+    return torch.linspace(float(q_min), float(q_max), n, device=q_vectors.device)
+
+def draw_q_annulus_mask(ax, q_vectors, q_center, width, q_reference=None,
+                        origin="lower", lw=1.0, color="white"):
+    """
+    Overlay the boundaries of a q annulus on an image axis.
+
+    The boundaries are the two |q - q_reference| iso-contours bounding the bin,
+    drawn with ``ax.contour`` so they correctly follow the elliptical/curved
+    equivalent-q loci (rather than assuming circles).
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis on which the corresponding image was drawn with ``imshow``.
+    q_vectors : torch.Tensor of shape (H, W, 3)
+        Per-pixel momentum-transfer vectors.
+    q_center, width : float
+        Center and full width of the q bin, matching ``create_q_annulus_mask``.
+    q_reference : torch.Tensor of shape (3,) or None
+        Origin from which |q - q_reference| is measured. Defaults to the
+        detector-center pixel (the Bragg peak).
+    origin : {"lower", "upper"}
+        Must match the ``origin`` passed to the paired ``imshow`` call so the
+        overlay aligns with the image.
+    lw : float
+        Contour line width.
+    color : str
+        Contour line color.
+    """
+    dq = _delta_q_magnitude(q_vectors, q_reference)
+
+    levels = sorted([q_center - width / 2, q_center + width / 2])
+    ax.contour(
+        dq.detach().cpu().numpy(),
+        levels=levels,
+        colors=color,
+        linewidths=lw,
+        origin=origin,
+    )
